@@ -1,16 +1,14 @@
 /* kstuff-probe.c — payload autonome PS5 : dump noyau + scan de candidats
- * 100% lecture seule cote noyau. Ecrit uniquement sur la cle USB.
- * Se termine proprement (pas de boucle infinie) pour un arret propre.
+ * 100% lecture seule cote noyau. Ecrit en priorite sur la cle USB.
+ * Se termine proprement pour permettre un arret propre de la console.
  */
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
 
-#define VER      "probe-1.6"
+#define VER      "probe-1.7"
 #define LOG_NAME "kstuff_probe.txt"
 
-/* Tailles de dump si l'exploit ne les fournit pas.
-   Baisse-les (ex. 0x1000000 / 0x2000000) pour ecrire moins de donnees. */
 #define DUMP_TEXT_DEF 0x2000000   /* 32 Mo */
 #define DUMP_DATA_DEF 0x4000000   /* 64 Mo */
 
@@ -70,7 +68,6 @@ static void out(const char *s) {
     if (g_log >= 0) ksys(SYS_write, g_log, (long)s, k, 0, 0, 0);
 }
 
-/* ferme puis rouvre : garantit que tout est ecrit sur la cle avant la suite */
 static void log_open(int trunc) {
     if (g_log >= 0) { ksys(SYS_close, g_log, 0, 0, 0, 0, 0); g_log = -1; }
     g_log = ksys(SYS_open, (long)g_logp, O_WRONLY|O_CREAT|(trunc ? O_TRUNC : O_APPEND),
@@ -147,12 +144,35 @@ static void join_path(char *dst, const char *dir, const char *name) {
     dst[i] = 0;
 }
 
+/* ---------------- choix du dossier de sortie ---------------- */
+static const char *g_dir = "/mnt/usb0/";
+static int g_internal = 0;
+
+static int dir_ok(const char *dir) {
+    char p[64];
+    join_path(p, dir, ".kstuff");
+    long fd = ksys(SYS_open, (long)p, O_WRONLY|O_CREAT, 0644, 0, 0, 0);
+    if (fd < 0) return 0;
+    ksys(SYS_close, fd, 0, 0, 0, 0, 0);
+    return 1;
+}
+
+/* on teste plusieurs points de montage avant de replier sur l'interne */
+static void pick_dir(void) {
+    static const char *cand[] = { "/mnt/usb0/", "/mnt/usb1/", "/mnt/usb2/", "/mnt/usb3/" };
+    for (int i = 0; i < 4; i++)
+        if (dir_ok(cand[i])) { g_dir = cand[i]; g_internal = 0; return; }
+    g_dir = "/data/";
+    g_internal = 1;
+}
+
 static uint64_t idt_get(void) {
     struct { uint16_t l; uint64_t b; } __attribute__((packed)) r;
     __asm__ volatile("sidt %0" : "=m"(r));
     return r.b;
 }
 
+/* lecture de CR3 : autorisee en ring 3 (l'ecriture exige CPL 0, pas la lecture) */
 static uint64_t cr3_get(void) {
     uint64_t v; __asm__ volatile("mov %%cr3,%0" : "=r"(v)); return v;
 }
@@ -162,7 +182,6 @@ static uint8_t g_buf[0x10000 + 0x40];
 
 struct pat { const uint8_t *pat; size_t len; const char *name; uint64_t found; };
 
-/* cherche PLUSIEURS motifs en UNE seule passe */
 static void scan_all(struct pat *list, int n, uint64_t start, uint64_t end)
 {
     for (uint64_t base = start; base + 16 <= end; base += 0x10000) {
@@ -178,7 +197,7 @@ static void scan_all(struct pat *list, int n, uint64_t start, uint64_t end)
             const uint8_t *p = list[k].pat;
             size_t L = list[k].len;
             for (size_t i = 0; i + L <= n2; i++) {
-                if (g_buf[i] != p[0]) continue;      /* filtre rapide */
+                if (g_buf[i] != p[0]) continue;
                 bool ok = true;
                 for (size_t j = 1; j < L; j++)
                     if (g_buf[i + j] != p[j]) { ok = false; break; }
@@ -189,7 +208,6 @@ static void scan_all(struct pat *list, int n, uint64_t start, uint64_t end)
     }
 }
 
-/* remonte au prologue le plus proche avant `addr` */
 static uint64_t func_start(uint64_t addr) {
     uint64_t page = addr & ~0xfffULL;
     for (int k = 0; k < 12 && page >= K.kern_base; k++, page -= 0x1000) {
@@ -204,12 +222,18 @@ static uint64_t func_start(uint64_t addr) {
     return 0;
 }
 
-/* reduit la plage tant que la fin n'est pas lisible (evite le non-mappe) */
+/* reduit la plage tant qu'un des 4 points echantillonnes n'est pas lisible */
 static uint64_t fit_range(uint64_t base, uint64_t size) {
     uint8_t tmp[16];
     int guard = 0;
     while (size > 0x100000 && guard++ < 8) {
-        if (kread(tmp, base + size - 16, 16) == 0) break;
+        int bad = 0;
+        for (int i = 0; i < 4; i++) {
+            uint64_t a = base + (size / 4) * (uint64_t)i;
+            if (a + 16 > base + size) a = base + size - 16;
+            if (kread(tmp, a, 16) != 0) { bad = 1; break; }
+        }
+        if (!bad) break;
         size >>= 1;
     }
     return size;
@@ -226,8 +250,6 @@ struct __attribute__((packed)) phdr {
     uint32_t type, flags;
     uint64_t offset, vaddr, paddr, filesz, memsz, align;
 };
-
-static const char *g_dir = "/mnt/usb0/";
 
 static void mkelf(const char *name, uint64_t vaddr, uint64_t size) {
     char path[128];
@@ -253,17 +275,21 @@ static void mkelf(const char *name, uint64_t vaddr, uint64_t size) {
     static uint8_t pad[0x1000];
     ksys(SYS_write, fd, (long)pad, 0x1000 - (sizeof e + sizeof p), 0, 0, 0);
 
-    uint64_t next = 0x800000;   /* point de progression tous les 8 Mo */
+    uint64_t next = 0x800000;
+    int fails = 0;
     for (uint64_t off = 0; off < size; off += 0x10000) {
         size_t n2 = 0x10000;
         if (off + n2 > size) n2 = size - off;
-        kread(g_buf, vaddr + off, n2);
+        /* un echec de lecture est detecte : bloc remis a zero pour garder
+           l'alignement des offsets dans le fichier */
+        if (kread(g_buf, vaddr + off, n2) != 0) { memset(g_buf, 0, n2); fails++; }
         ksys(SYS_write, fd, (long)g_buf, n2, 0, 0, 0);
         if (off >= next) { out("."); log_flush(); next += 0x800000; }
     }
     ksys(SYS_close, fd, 0, 0, 0, 0, 0);
     out("\n");
     kprintf("dump OK : %s  (%#lx octets @ %p)\n", path, size, vaddr);
+    if (fails) kprintf("  !! %d bloc(s) illisible(s) remis a zero\n", fails);
 }
 
 /* ---------------- ancres ---------------- */
@@ -350,14 +376,14 @@ void _start(void) {
     out("  kstuff probe " VER "  (lecture seule)\n");
     out("================================\n\n");
 
-    g_dir = "/mnt/usb0/";
-    long t = ksys(SYS_open, (long)"/mnt/usb0/.probe", O_WRONLY|O_CREAT, 0644, 0, 0, 0);
-    if (t >= 0) ksys(SYS_close, t, 0, 0, 0, 0, 0);
-    else g_dir = "/data/";
-
+    pick_dir();
     join_path(g_logp, g_dir, LOG_NAME);
     log_open(1);
     kprintf("sortie : %s\n", g_dir);
+    if (g_internal) {
+        out("!! PAS DE CLE USB DETECTEE -> ecriture sur le stockage INTERNE\n");
+        out("!! rebranche la cle et relance si tu veux preserver le SSD\n");
+    }
 
     struct kstuff_api *api = (struct kstuff_api *)ksys(SYS_jailbreak, 0, 0, 0, 0, 0, 0);
     kprintf("jailbreak() -> %p\n", (uint64_t)api);
@@ -381,8 +407,6 @@ void _start(void) {
     kprintf("data_base       %p\n", K.data_base);
     kprintf("text_size       %#lx\n", K.text_size);
     kprintf("data_size       %#lx\n", K.data_size);
-    kprintf("idt (sidt)      %p\n", idt_get());
-    kprintf("cr3 (pml4)      %p\n", cr3_get());
 
     if ((K.kern_base >> 32) != 0xffffffffULL)
         out("!! kern_base ne ressemble pas a une adresse noyau\n");
@@ -395,12 +419,22 @@ void _start(void) {
             out("test lecture kern_base : ");
             for (int i = 0; i < 16; i++) { outx(test[i]); out(" "); }
             out("\n");
-        } else out("test lecture kern_base : ECHEC\n");
+        } else {
+            out("test lecture kern_base : ECHEC\n");
+            out("!! l'API noyau ne correspond peut-etre pas a ce payload\n");
+        }
     }
 
-    /* on reduit les plages si leur fin n'est pas lisible */
     K.text_size = fit_range(K.kern_base, K.text_size);
     K.data_size = fit_range(K.data_base, K.data_size);
+
+    /* si on ecrit sur l'interne, on reduit la casse */
+    if (g_internal) {
+        if (K.text_size > 0x1000000) K.text_size = 0x1000000;   /* 16 Mo */
+        if (K.data_size > 0x2000000) K.data_size = 0x2000000;   /* 32 Mo */
+        out("(stockage interne : tailles de dump reduites)\n");
+    }
+
     kprintf("plages retenues : text %#lx  data %#lx\n", K.text_size, K.data_size);
     log_flush();
 
@@ -423,9 +457,14 @@ void _start(void) {
     out("================================\n");
     log_flush();
 
+    /* --- idt et cr3 en DERNIER : meme si l'un des deux se comportait mal,
+           tout le reste est deja fait et ecrit --- */
+    out("\n--- registres (en dernier, par securite) ---\n");
+    kprintf("idt (sidt)      %p\n", idt_get());
+    kprintf("cr3 (pml4)      %p\n", cr3_get());
+    log_flush();
+
 fin:
-    /* pause puis on rend la main : la console redevient normale,
-       ce qui permet un arret PROPRE par le menu (protection du SSD). */
     {
         static long ts[2] = { 3, 0 };
         ksys(SYS_nanosleep, (long)ts, 0, 0, 0, 0, 0);
