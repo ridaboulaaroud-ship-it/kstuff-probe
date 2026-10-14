@@ -6,11 +6,16 @@
 #include <stddef.h>
 #include <stdbool.h>
 
-#define VER      "probe-1.7"
+#define VER      "probe-1.8"
 #define LOG_NAME "kstuff_probe.txt"
 
 #define DUMP_TEXT_DEF 0x2000000   /* 32 Mo */
 #define DUMP_DATA_DEF 0x4000000   /* 64 Mo */
+
+/* cr3 n'est qu'informatif. Mets 0 pour zero risque.
+   Si la lecture est refusee, seule la fin du payload s'arrete (SIGILL),
+   la console n'est pas affectee. */
+#define READ_CR3 1
 
 /* ---------------- memoire (pas de libc) ---------------- */
 void *memcpy(void *d, const void *s, size_t n);
@@ -157,7 +162,6 @@ static int dir_ok(const char *dir) {
     return 1;
 }
 
-/* on teste plusieurs points de montage avant de replier sur l'interne */
 static void pick_dir(void) {
     static const char *cand[] = { "/mnt/usb0/", "/mnt/usb1/", "/mnt/usb2/", "/mnt/usb3/" };
     for (int i = 0; i < 4; i++)
@@ -172,7 +176,6 @@ static uint64_t idt_get(void) {
     return r.b;
 }
 
-/* lecture de CR3 : autorisee en ring 3 (l'ecriture exige CPL 0, pas la lecture) */
 static uint64_t cr3_get(void) {
     uint64_t v; __asm__ volatile("mov %%cr3,%0" : "=r"(v)); return v;
 }
@@ -222,7 +225,6 @@ static uint64_t func_start(uint64_t addr) {
     return 0;
 }
 
-/* reduit la plage tant qu'un des 4 points echantillonnes n'est pas lisible */
 static uint64_t fit_range(uint64_t base, uint64_t size) {
     uint8_t tmp[16];
     int guard = 0;
@@ -251,12 +253,23 @@ struct __attribute__((packed)) phdr {
     uint64_t offset, vaddr, paddr, filesz, memsz, align;
 };
 
+/* ecrit un bloc et verifie que TOUT a bien ete ecrit */
+static int write_all(long fd, const void *buf, size_t n) {
+    size_t done = 0;
+    while (done < n) {
+        long w = ksys(SYS_write, fd, (long)((const uint8_t *)buf + done), n - done, 0, 0, 0);
+        if (w <= 0) return 0;
+        done += (size_t)w;
+    }
+    return 1;
+}
+
 static void mkelf(const char *name, uint64_t vaddr, uint64_t size) {
     char path[128];
     join_path(path, g_dir, name);
 
     long fd = ksys(SYS_open, (long)path, O_WRONLY|O_CREAT|O_TRUNC, 0644, 0, 0, 0);
-    if (fd < 0) { kprintf("dump KO: %s\n", path); return; }
+    if (fd < 0) { kprintf("dump KO (open): %s\n", path); return; }
 
     struct ehdr e; memset(&e, 0, sizeof e);
     e.ident[0]=0x7f; e.ident[1]='E'; e.ident[2]='L'; e.ident[3]='F';
@@ -270,26 +283,27 @@ static void mkelf(const char *name, uint64_t vaddr, uint64_t size) {
     p.offset=0x1000; p.vaddr=vaddr; p.paddr=vaddr;
     p.filesz=size; p.memsz=size; p.align=0x1000;
 
-    ksys(SYS_write, fd, (long)&e, sizeof e, 0, 0, 0);
-    ksys(SYS_write, fd, (long)&p, sizeof p, 0, 0, 0);
+    if (!write_all(fd, &e, sizeof e)) { out("dump KO (entete)\n"); ksys(SYS_close, fd,0,0,0,0,0); return; }
+    if (!write_all(fd, &p, sizeof p)) { out("dump KO (phdr)\n");  ksys(SYS_close, fd,0,0,0,0,0); return; }
     static uint8_t pad[0x1000];
-    ksys(SYS_write, fd, (long)pad, 0x1000 - (sizeof e + sizeof p), 0, 0, 0);
+    if (!write_all(fd, pad, 0x1000 - (sizeof e + sizeof p))) {
+        out("dump KO (padding)\n"); ksys(SYS_close, fd,0,0,0,0,0); return;
+    }
 
     uint64_t next = 0x800000;
-    int fails = 0;
+    int fails = 0, wfails = 0;
     for (uint64_t off = 0; off < size; off += 0x10000) {
         size_t n2 = 0x10000;
         if (off + n2 > size) n2 = size - off;
-        /* un echec de lecture est detecte : bloc remis a zero pour garder
-           l'alignement des offsets dans le fichier */
         if (kread(g_buf, vaddr + off, n2) != 0) { memset(g_buf, 0, n2); fails++; }
-        ksys(SYS_write, fd, (long)g_buf, n2, 0, 0, 0);
+        if (!write_all(fd, g_buf, n2)) { wfails++; }
         if (off >= next) { out("."); log_flush(); next += 0x800000; }
     }
     ksys(SYS_close, fd, 0, 0, 0, 0, 0);
     out("\n");
-    kprintf("dump OK : %s  (%#lx octets @ %p)\n", path, size, vaddr);
-    if (fails) kprintf("  !! %d bloc(s) illisible(s) remis a zero\n", fails);
+    kprintf("dump : %s  (%#lx octets @ %p)\n", path, size, vaddr);
+    if (fails)  kprintf("  !! %d bloc(s) illisible(s) remis a zero\n", fails);
+    if (wfails) kprintf("  !! %d ecriture(s) en echec (cle pleine ou debranchee ?)\n", wfails);
 }
 
 /* ---------------- ancres ---------------- */
@@ -381,8 +395,8 @@ void _start(void) {
     log_open(1);
     kprintf("sortie : %s\n", g_dir);
     if (g_internal) {
-        out("!! PAS DE CLE USB DETECTEE -> ecriture sur le stockage INTERNE\n");
-        out("!! rebranche la cle et relance si tu veux preserver le SSD\n");
+        out("!! PAS DE CLE USB -> ecriture sur le stockage INTERNE\n");
+        out("!! rebranche la cle et relance pour preserver le SSD\n");
     }
 
     struct kstuff_api *api = (struct kstuff_api *)ksys(SYS_jailbreak, 0, 0, 0, 0, 0, 0);
@@ -413,26 +427,40 @@ void _start(void) {
     if (K.data_base < K.kern_base)
         out("!! data_base < kern_base : structure inattendue\n");
 
+    /* --- double test de lecture : si LES DEUX echouent, on saute le dump --- */
+    int ok_text = 0, ok_data = 0;
     {
         uint8_t test[16];
         if (kread(test, K.kern_base, 16) == 0) {
+            ok_text = 1;
             out("test lecture kern_base : ");
             for (int i = 0; i < 16; i++) { outx(test[i]); out(" "); }
             out("\n");
-        } else {
-            out("test lecture kern_base : ECHEC\n");
-            out("!! l'API noyau ne correspond peut-etre pas a ce payload\n");
-        }
+        } else out("test lecture kern_base : ECHEC\n");
+
+        if (kread(test, K.data_base, 16) == 0) {
+            ok_data = 1;
+            out("test lecture data_base : OK\n");
+        } else out("test lecture data_base : ECHEC\n");
     }
+
+    if (!ok_text && !ok_data) {
+        out("\n!! AUCUNE lecture noyau ne fonctionne\n");
+        out("!! l'API ne correspond pas a ce payload -> dump saute\n");
+        out("!! (96 Mo de donnees fausses ne servent a rien)\n");
+        log_flush();
+        goto fin;
+    }
+    if (!ok_text || !ok_data)
+        out("!! une seule des deux zones repond : resultats a prendre avec prudence\n");
 
     K.text_size = fit_range(K.kern_base, K.text_size);
     K.data_size = fit_range(K.data_base, K.data_size);
 
-    /* si on ecrit sur l'interne, on reduit la casse */
     if (g_internal) {
         if (K.text_size > 0x1000000) K.text_size = 0x1000000;   /* 16 Mo */
         if (K.data_size > 0x2000000) K.data_size = 0x2000000;   /* 32 Mo */
-        out("(stockage interne : tailles de dump reduites)\n");
+        out("(stockage interne : tailles reduites)\n");
     }
 
     kprintf("plages retenues : text %#lx  data %#lx\n", K.text_size, K.data_size);
@@ -457,12 +485,21 @@ void _start(void) {
     out("================================\n");
     log_flush();
 
-    /* --- idt et cr3 en DERNIER : meme si l'un des deux se comportait mal,
-           tout le reste est deja fait et ecrit --- */
-    out("\n--- registres (en dernier, par securite) ---\n");
+    /* --- idt puis cr3, en DERNIER ---
+       Si la lecture de cr3 est refusee en ring 3, le noyau envoie un
+       SIGILL au processus du payload : il s'arrete ICI, mais la console
+       reste allumee et tous les fichiers sont deja ecrits. */
+    out("\n--- registres (en dernier) ---\n");
     kprintf("idt (sidt)      %p\n", idt_get());
+    log_flush();
+#if READ_CR3
+    out("lecture cr3... (si le payload s'arrete ici, c'est normal)\n");
+    log_flush();
     kprintf("cr3 (pml4)      %p\n", cr3_get());
     log_flush();
+#else
+    out("cr3 : desactive par READ_CR3=0\n");
+#endif
 
 fin:
     {
