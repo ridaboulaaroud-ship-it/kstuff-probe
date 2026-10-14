@@ -5,7 +5,8 @@
 #include <stddef.h>
 #include <stdbool.h>
 
-#define VER "probe-1.0"
+#define VER      "probe-1.1"
+#define LOG_NAME "kstuff_probe.txt"
 
 /* ---------------- syscalls ---------------- */
 static long ksys(long n, long a, long b, long c, long d, long e, long f) {
@@ -30,44 +31,45 @@ static long ksys(long n, long a, long b, long c, long d, long e, long f) {
 
 /* ---------------- sortie ---------------- */
 static long g_log = -1;
+
 static void out(const char *s) {
-    size_t n = 0; while (s[n]) n++;
-    ksys(SYS_write, 1, (long)s, n, 0, 0, 0);
-    if (g_log >= 0) ksys(SYS_write, g_log, (long)s, n, 0, 0, 0);
+    size_t k = 0; while (s[k]) k++;
+    ksys(SYS_write, 1, (long)s, k, 0, 0, 0);
+    if (g_log >= 0) ksys(SYS_write, g_log, (long)s, k, 0, 0, 0);
 }
-static void outx(uint64_t v, int width) {
+
+static void outx(uint64_t v) {
     char b[24]; int i = 24; b[--i] = 0;
     if (!v) b[--i] = '0';
     while (v && i) { b[--i] = "0123456789abcdef"[v & 15]; v >>= 4; }
-    while (i > 24 - width - 1 && i) b[--i] = '0';
     out(&b[i]);
 }
+
 static void outd(int64_t v) {
     if (v < 0) { out("-"); v = -v; }
-    outx((uint64_t)v, 0);
+    outx((uint64_t)v);
 }
+
 static void kprintf(const char *f, ...) {
     __builtin_va_list ap; __builtin_va_start(ap, f);
     for (; *f; f++) {
         if (*f != '%') { char c[2] = { *f, 0 }; out(c); continue; }
         f++;
-        /* saute drapeaux et largeurs : %-24s, %#lx, %02x ... */
         while (*f == '#' || *f == '-' || *f == '+' || *f == ' ' || *f == '0' ||
                (*f >= '1' && *f <= '9') || *f == 'l' || *f == 'h' || *f == 'z')
             f++;
         switch (*f) {
             case 's': out(__builtin_va_arg(ap, const char *)); break;
             case 'd': case 'i': outd(__builtin_va_arg(ap, int)); break;
-            case 'u': outx((uint64_t)__builtin_va_arg(ap, unsigned), 0); break;
-            case 'x': outx(__builtin_va_arg(ap, uint64_t), 0); break;
-            case 'p': out("0x"); outx(__builtin_va_arg(ap, uint64_t), 0); break;
+            case 'u': outx((uint64_t)__builtin_va_arg(ap, unsigned)); break;
+            case 'x': outx(__builtin_va_arg(ap, uint64_t)); break;
+            case 'p': out("0x"); outx(__builtin_va_arg(ap, uint64_t)); break;
             case '%': out("%"); break;
             case 0: __builtin_va_end(ap); return;
         }
     }
     __builtin_va_end(ap);
 }
-#define P(x) kprintf("%-24s %p   off %#lx\n", #x, (uint64_t)(x), (uint64_t)(x) - K.kern_base)
 
 /* ---------------- etat noyau ---------------- */
 struct kstuff_api {
@@ -76,6 +78,7 @@ struct kstuff_api {
     int (*kwrite)(uint64_t, const void *, size_t);
     int (*kcall)(uint64_t, uint64_t *, int, uint64_t *);
 };
+
 static struct {
     uint64_t kern_base, data_base, text_size, data_size;
     int (*kread)(uint64_t, void *, size_t);
@@ -89,18 +92,28 @@ static int kread(void *dst, uint64_t addr, size_t n) {
 
 /* ---------------- utilitaires ---------------- */
 static uint64_t rd64(const uint8_t *p) { uint64_t v; __builtin_memcpy(&v, p, 8); return v; }
-static int kmemmem(const uint8_t *h, size_t hn, const char *n) {
-    size_t ln = 0; while (n[ln]) ln++;
-    if (!ln || ln > hn) return 0;
-    for (size_t i = 0; i + ln <= hn; i++)
-        if (__builtin_memcmp(h + i, n, ln) == 0) return 1;
+
+static int kmemmem(const uint8_t *h, size_t hn, const char *s) {
+    size_t sl = 0; while (s[sl]) sl++;
+    if (!sl || sl > hn) return 0;
+    for (size_t i = 0; i + sl <= hn; i++)
+        if (__builtin_memcmp(h + i, s, sl) == 0) return 1;
     return 0;
 }
+
+static void join_path(char *dst, const char *dir, const char *name) {
+    int i = 0;
+    while (dir[i]) { dst[i] = dir[i]; i++; }
+    for (int j = 0; name[j]; j++) dst[i++] = name[j];
+    dst[i] = 0;
+}
+
 static uint64_t idt_get(void) {
     struct { uint16_t l; uint64_t b; } __attribute__((packed)) r;
     __asm__ volatile("sidt %0" : "=m"(r));
     return r.b;
 }
+
 static uint64_t cr3_get(void) {
     uint64_t v; __asm__ volatile("mov %%cr3,%0" : "=r"(v)); return v;
 }
@@ -108,7 +121,7 @@ static uint64_t cr3_get(void) {
 /* ---------------- scanner ---------------- */
 static uint8_t g_buf[0x10000 + 0x40];
 
-static uint64_t kscan(const uint8_t *pat, const char *mask,
+static uint64_t kscan(const uint8_t *pat, const char *pmask,
                       size_t len, uint64_t start, uint64_t end)
 {
     for (uint64_t base = start; base + len <= end; base += 0x10000) {
@@ -119,19 +132,21 @@ static uint64_t kscan(const uint8_t *pat, const char *mask,
         for (size_t i = 0; i + len <= n; i++) {
             bool ok = true;
             for (size_t j = 0; j < len; j++)
-                if (mask[j] != '?' && g_buf[i + j] != pat[j]) { ok = false; break; }
+                if (pmask[j] != '?' && g_buf[i + j] != pat[j]) { ok = false; break; }
             if (ok) return base + i;
         }
     }
     return 0;
 }
+
 static uint64_t kscan_str(const char *s, uint64_t start, uint64_t end) {
-    size_t ln = 0; while (s[ln]) ln++;
-    static char mask[256];
-    for (size_t i = 0; i < ln; i++) mask[i] = 'x';
-    mask[ln] = 0;
-    return kscan((const uint8_t *)s, mask, ln, start, end);
+    size_t sl = 0; while (s[sl]) sl++;
+    static char pmask[256];
+    for (size_t i = 0; i < sl; i++) pmask[i] = 'x';
+    pmask[sl] = 0;
+    return kscan((const uint8_t *)s, pmask, sl, start, end);
 }
+
 static uint64_t func_start(uint64_t addr) {
     uint64_t page = addr & ~0xfffULL;
     for (int k = 0; k < 12 && page >= K.kern_base; k++, page -= 0x1000) {
@@ -152,6 +167,7 @@ struct __attribute__((packed)) ehdr {
     uint64_t entry, phoff, shoff; uint32_t flags;
     uint16_t ehsize, phentsize, phnum, shentsize, shnum, shstrndx;
 };
+
 struct __attribute__((packed)) phdr {
     uint32_t type, flags;
     uint64_t offset, vaddr, paddr, filesz, memsz, align;
@@ -160,10 +176,8 @@ struct __attribute__((packed)) phdr {
 static const char *g_dir = "/mnt/usb0/";
 
 static void mkelf(const char *name, uint64_t vaddr, uint64_t size) {
-    char path[128]; int n = 0;
-    while (g_dir[n]) { path[n] = g_dir[n]; n++; }
-    for (int i = 0; name[i]; i++) path[n++] = name[i];
-    path[n] = 0;
+    char path[128];
+    join_path(path, g_dir, name);
 
     long fd = ksys(SYS_open, (long)path, O_WRONLY|O_CREAT|O_TRUNC, 0644, 0, 0, 0);
     if (fd < 0) { kprintf("dump KO: %s\n", path); return; }
@@ -199,23 +213,30 @@ static void mkelf(const char *name, uint64_t vaddr, uint64_t size) {
 static const uint8_t AES_SBOX[16] = {
     0x63,0x7C,0x77,0x7B,0xF2,0x6B,0x6F,0xC5,
     0x30,0x01,0x67,0x2B,0xFE,0xD7,0xAB,0x76 };
+
 static const uint8_t SHA256_IV[16] = {
     0x67,0xE6,0x09,0x6A,0x85,0xAE,0x67,0xBB,
     0x72,0xF3,0x6E,0x3C,0x3A,0xF5,0x4F,0xA5 };
+
 static const char M16[] = "xxxxxxxxxxxxxxxx";
 
 static void probe_crypto(void) {
     uint64_t a, f;
     out("\n--- ancres crypto ---\n");
+
     a = kscan(AES_SBOX, M16, 16, K.kern_base, K.kern_base + K.text_size);
-    if (a) { P(a); f = func_start(a);
-             if (f) kprintf("   -> fonction contenante %p  off %#lx\n", f, f - K.kern_base); }
-    else out("aes_sbox       : introuvable\n");
+    if (a) {
+        kprintf("aes_sbox        %p  off %#lx\n", a, a - K.kern_base);
+        f = func_start(a);
+        if (f) kprintf("  -> fonction    %p  off %#lx\n", f, f - K.kern_base);
+    } else out("aes_sbox        : introuvable\n");
 
     a = kscan(SHA256_IV, M16, 16, K.kern_base, K.kern_base + K.text_size);
-    if (a) { P(a); f = func_start(a);
-             if (f) kprintf("   -> fonction contenante %p  off %#lx\n", f, f - K.kern_base); }
-    else out("sha256_iv      : introuvable\n");
+    if (a) {
+        kprintf("sha256_iv       %p  off %#lx\n", a, a - K.kern_base);
+        f = func_start(a);
+        if (f) kprintf("  -> fonction    %p  off %#lx\n", f, f - K.kern_base);
+    } else out("sha256_iv       : introuvable\n");
 }
 
 static void probe_strings(void) {
@@ -226,8 +247,8 @@ static void probe_strings(void) {
     out("\n--- chaines dans .data ---\n");
     for (size_t i = 0; i < sizeof need / sizeof *need; i++) {
         uint64_t a = kscan_str(need[i], K.data_base, K.data_base + K.data_size);
-        if (a) kprintf("%-28s %p  off %#lx\n", need[i], a, a - K.data_base);
-        else   kprintf("%-28s (absent)\n", need[i]);
+        if (a) kprintf("%s  %p  off %#lx\n", need[i], a, a - K.data_base);
+        else   kprintf("%s  (absent)\n", need[i]);
     }
 }
 
@@ -263,8 +284,50 @@ void _start(void) {
 
     g_dir = "/mnt/usb0/";
     long t = ksys(SYS_open, (long)"/mnt/usb0/.probe", O_WRONLY|O_CREAT, 0644, 0, 0, 0);
-    if (t >= 0) ksys(SYS_close, t, 0,0,0,0,0); else g_dir = "/data/";
+    if (t >= 0) ksys(SYS_close, t, 0, 0, 0, 0, 0);
+    else g_dir = "/data/";
 
-    char logp[128]; int n = 0;
-    while (g_dir[n]) { logp[n] = g_dir[n]; n++; }
-    const char *ln =
+    char logp[128];
+    join_path(logp, g_dir, LOG_NAME);
+    g_log = ksys(SYS_open, (long)logp, O_WRONLY|O_CREAT|O_TRUNC, 0644, 0, 0, 0);
+
+    kprintf("sortie : %s\n", g_dir);
+
+    struct kstuff_api *api = (struct kstuff_api *)ksys(SYS_jailbreak, 0, 0, 0, 0, 0, 0);
+    if (!api || !api->kread) {
+        out("!! jailbreak() indisponible : lance l'exploit AVANT ce payload\n");
+        goto fin;
+    }
+    K.kern_base = api->kern_base;
+    K.data_base = api->data_base;
+    K.text_size = api->text_size ? api->text_size : 0x2000000;
+    K.data_size = api->data_size ? api->data_size : 0x4000000;
+    K.kread = api->kread;
+    K.kwrite = api->kwrite;
+
+    out("\n--- bases ---\n");
+    kprintf("kern_base       %p\n", K.kern_base);
+    kprintf("data_base       %p\n", K.data_base);
+    kprintf("text_size       %#lx\n", K.text_size);
+    kprintf("data_size       %#lx\n", K.data_size);
+    kprintf("idt (sidt)      %p\n", idt_get());
+    kprintf("cr3 (pml4)      %p\n", cr3_get());
+
+    out("\n--- dump noyau ---\n");
+    mkelf("kernel_text.elf", K.kern_base, K.text_size);
+    mkelf("kernel_data.elf", K.data_base, K.data_size);
+
+    probe_crypto();
+    probe_strings();
+    probe_allproc();
+
+    out("\n--- fin ---\n");
+    out("Envoie-moi kstuff_probe.txt\n");
+
+fin:
+    if (g_log >= 0) ksys(SYS_close, g_log, 0, 0, 0, 0, 0);
+    for (;;) {
+        static long ts[2] = { 1, 0 };
+        ksys(SYS_nanosleep, (long)ts, 0, 0, 0, 0, 0);
+    }
+}
