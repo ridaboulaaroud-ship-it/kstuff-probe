@@ -9,12 +9,18 @@ jobs:
       - name: Installer les outils
         run: |
           sudo apt-get update
-          sudo apt-get install -y git build-essential clang lld cmake curl xz-utils python3
+          sudo apt-get install -y git build-essential clang lld cmake ninja-build curl xz-utils python3
 
       - name: Recuperer le SDK PS5
         run: |
-          git clone --depth 1 https://github.com/ps5-payload-dev/ps5-payload-sdk "$HOME/sdk"
-          cd "$HOME/sdk" && ./build.sh
+          set -e
+          git clone --depth 1 https://github.com/john-tornblom/ps5-payload-sdk "$HOME/sdk"
+          cd "$HOME/sdk"
+          if [ -f build.sh ]; then chmod +x build.sh; ./build.sh; else make; fi
+
+      - name: Verifier le SDK
+        run: |
+          ls -l "$HOME/sdk/bin" || true
 
       - name: Compiler le payload
         env:
