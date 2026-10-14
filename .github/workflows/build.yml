@@ -11,4 +11,21 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y git build-essential clang lld cmake curl xz-utils python3
 
-      - name: Recuperer le SDK
+      - name: Recuperer le SDK PS5
+        run: |
+          git clone --depth 1 https://github.com/ps5-payload-dev/ps5-payload-sdk "$HOME/sdk"
+          cd "$HOME/sdk" && ./build.sh
+
+      - name: Compiler le payload
+        env:
+          PS5_PAYLOAD_SDK: /home/runner/sdk
+        run: make
+
+      - name: Verifier le resultat
+        run: ls -lh kstuff-probe.elf
+
+      - name: Publier l'artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kstuff-probe.elf
+          path: kstuff-probe.elf
