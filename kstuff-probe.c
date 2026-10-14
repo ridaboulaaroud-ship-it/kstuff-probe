@@ -6,7 +6,7 @@
 #include <stddef.h>
 #include <stdbool.h>
 
-#define VER      "probe-1.4"
+#define VER      "probe-1.6"
 #define LOG_NAME "kstuff_probe.txt"
 
 /* Tailles de dump si l'exploit ne les fournit pas.
@@ -160,32 +160,36 @@ static uint64_t cr3_get(void) {
 /* ---------------- scanner ---------------- */
 static uint8_t g_buf[0x10000 + 0x40];
 
-static uint64_t kscan(const uint8_t *pat, const char *pmask,
-                      size_t len, uint64_t start, uint64_t end)
+struct pat { const uint8_t *pat; size_t len; const char *name; uint64_t found; };
+
+/* cherche PLUSIEURS motifs en UNE seule passe */
+static void scan_all(struct pat *list, int n, uint64_t start, uint64_t end)
 {
-    for (uint64_t base = start; base + len <= end; base += 0x10000) {
-        size_t n = sizeof g_buf;
-        if (base + n > end) n = end - base;
-        if (n < len) break;
-        if (kread(g_buf, base, n) != 0) continue;
-        for (size_t i = 0; i + len <= n; i++) {
-            bool ok = true;
-            for (size_t j = 0; j < len; j++)
-                if (pmask[j] != '?' && g_buf[i + j] != pat[j]) { ok = false; break; }
-            if (ok) return base + i;
+    for (uint64_t base = start; base + 16 <= end; base += 0x10000) {
+        size_t n2 = sizeof g_buf;
+        if (base + n2 > end) n2 = end - base;
+        if (n2 < 16) break;
+        if (kread(g_buf, base, n2) != 0) continue;
+
+        int left = 0;
+        for (int k = 0; k < n; k++) {
+            if (list[k].found) continue;
+            left++;
+            const uint8_t *p = list[k].pat;
+            size_t L = list[k].len;
+            for (size_t i = 0; i + L <= n2; i++) {
+                if (g_buf[i] != p[0]) continue;      /* filtre rapide */
+                bool ok = true;
+                for (size_t j = 1; j < L; j++)
+                    if (g_buf[i + j] != p[j]) { ok = false; break; }
+                if (ok) { list[k].found = base + i; break; }
+            }
         }
+        if (!left) break;
     }
-    return 0;
 }
 
-static uint64_t kscan_str(const char *s, uint64_t start, uint64_t end) {
-    size_t sl = 0; while (s[sl]) sl++;
-    static char pmask[256];
-    for (size_t i = 0; i < sl; i++) pmask[i] = 'x';
-    pmask[sl] = 0;
-    return kscan((const uint8_t *)s, pmask, sl, start, end);
-}
-
+/* remonte au prologue le plus proche avant `addr` */
 static uint64_t func_start(uint64_t addr) {
     uint64_t page = addr & ~0xfffULL;
     for (int k = 0; k < 12 && page >= K.kern_base; k++, page -= 0x1000) {
@@ -198,6 +202,17 @@ static uint64_t func_start(uint64_t addr) {
         }
     }
     return 0;
+}
+
+/* reduit la plage tant que la fin n'est pas lisible (evite le non-mappe) */
+static uint64_t fit_range(uint64_t base, uint64_t size) {
+    uint8_t tmp[16];
+    int guard = 0;
+    while (size > 0x100000 && guard++ < 8) {
+        if (kread(tmp, base + size - 16, 16) == 0) break;
+        size >>= 1;
+    }
+    return size;
 }
 
 /* ---------------- dump ELF ---------------- */
@@ -238,13 +253,16 @@ static void mkelf(const char *name, uint64_t vaddr, uint64_t size) {
     static uint8_t pad[0x1000];
     ksys(SYS_write, fd, (long)pad, 0x1000 - (sizeof e + sizeof p), 0, 0, 0);
 
+    uint64_t next = 0x800000;   /* point de progression tous les 8 Mo */
     for (uint64_t off = 0; off < size; off += 0x10000) {
         size_t n2 = 0x10000;
         if (off + n2 > size) n2 = size - off;
         kread(g_buf, vaddr + off, n2);
         ksys(SYS_write, fd, (long)g_buf, n2, 0, 0, 0);
+        if (off >= next) { out("."); log_flush(); next += 0x800000; }
     }
     ksys(SYS_close, fd, 0, 0, 0, 0, 0);
+    out("\n");
     kprintf("dump OK : %s  (%#lx octets @ %p)\n", path, size, vaddr);
 }
 
@@ -257,45 +275,57 @@ static const uint8_t SHA256_IV[16] = {
     0x67,0xE6,0x09,0x6A,0x85,0xAE,0x67,0xBB,
     0x72,0xF3,0x6E,0x3C,0x3A,0xF5,0x4F,0xA5 };
 
-static const char M16[] = "xxxxxxxxxxxxxxxx";
+static void probe_text(void) {
+    static struct pat list[2] = {
+        { AES_SBOX,   16, "aes_sbox",  0 },
+        { SHA256_IV,  16, "sha256_iv", 0 },
+    };
+    list[0].found = 0; list[1].found = 0;
 
-static void probe_crypto(void) {
-    uint64_t a, f;
-    out("\n--- ancres crypto ---\n");
+    out("\n--- ancres crypto (1 passe sur .text) ---\n");
+    scan_all(list, 2, K.kern_base, K.kern_base + K.text_size);
 
-    a = kscan(AES_SBOX, M16, 16, K.kern_base, K.kern_base + K.text_size);
-    if (a) {
-        kprintf("aes_sbox        %p  off %#lx\n", a, a - K.kern_base);
-        f = func_start(a);
-        if (f) kprintf("  -> fonction    %p  off %#lx\n", f, f - K.kern_base);
-    } else out("aes_sbox        : introuvable\n");
-
-    a = kscan(SHA256_IV, M16, 16, K.kern_base, K.kern_base + K.text_size);
-    if (a) {
-        kprintf("sha256_iv       %p  off %#lx\n", a, a - K.kern_base);
-        f = func_start(a);
-        if (f) kprintf("  -> fonction    %p  off %#lx\n", f, f - K.kern_base);
-    } else out("sha256_iv       : introuvable\n");
+    for (int k = 0; k < 2; k++) {
+        if (list[k].found) {
+            kprintf("%s  %p  off %#lx\n", list[k].name,
+                    list[k].found, list[k].found - K.kern_base);
+            uint64_t f = func_start(list[k].found);
+            if (f) kprintf("  -> fonction  %p  off %#lx\n", f, f - K.kern_base);
+        } else kprintf("%s  introuvable\n", list[k].name);
+    }
 }
 
-static void probe_strings(void) {
-    static const char *need[] = {
+static void probe_data(void) {
+    static const char *names[] = {
         "sceSblAuthMgrVerifyHeader", "SceSblAuthMgr", "sceSblAuthMgrIsLoadable",
         "SceSblPfs", "sceSblPfsCrypt", "a53", "SceA53", "Ppr", "Kraken"
     };
-    out("\n--- chaines dans .data ---\n");
-    for (size_t i = 0; i < sizeof need / sizeof *need; i++) {
-        uint64_t a = kscan_str(need[i], K.data_base, K.data_base + K.data_size);
-        if (a) kprintf("%s  %p  off %#lx\n", need[i], a, a - K.data_base);
-        else   kprintf("%s  (absent)\n", need[i]);
+    enum { N = sizeof names / sizeof *names };
+    static struct pat list[N];
+
+    for (int i = 0; i < (int)N; i++) {
+        size_t L = 0; while (names[i][L]) L++;
+        list[i].pat = (const uint8_t *)names[i];
+        list[i].len = L;
+        list[i].name = names[i];
+        list[i].found = 0;
+    }
+
+    out("\n--- chaines (1 passe sur .data) ---\n");
+    scan_all(list, (int)N, K.data_base, K.data_base + K.data_size);
+
+    for (int i = 0; i < (int)N; i++) {
+        if (list[i].found) kprintf("%s  %p  off %#lx\n",
+                                   names[i], list[i].found, list[i].found - K.data_base);
+        else               kprintf("%s  (absent)\n", names[i]);
     }
 }
 
 static void probe_allproc(void) {
-    uint64_t end = K.data_base + 0x800000;
+    uint64_t span = K.data_size < 0x800000 ? K.data_size : 0x800000;
     out("\n--- candidats allproc ---\n");
     int found = 0, probes = 0;
-    for (uint64_t off = 0; off + 0x10000 <= end - K.data_base; off += 0x10000) {
+    for (uint64_t off = 0; off + 0x10000 <= span; off += 0x10000) {
         if (kread(g_buf, K.data_base + off, 0x10000) != 0) continue;
         for (size_t i = 0; i + 8 <= 0x10000; i += 8) {
             uint64_t p = rd64(g_buf + i);
@@ -368,26 +398,33 @@ void _start(void) {
         } else out("test lecture kern_base : ECHEC\n");
     }
 
+    /* on reduit les plages si leur fin n'est pas lisible */
+    K.text_size = fit_range(K.kern_base, K.text_size);
+    K.data_size = fit_range(K.data_base, K.data_size);
+    kprintf("plages retenues : text %#lx  data %#lx\n", K.text_size, K.data_size);
     log_flush();
 
-    out("\n--- dump noyau ---\n");
+    out("\n--- dump noyau (points = progression) ---\n");
     mkelf("kernel_text.elf", K.kern_base, K.text_size);
     log_flush();
     mkelf("kernel_data.elf", K.data_base, K.data_size);
     log_flush();
 
-    probe_crypto();
+    probe_text();
     log_flush();
-    probe_strings();
+    probe_data();
     log_flush();
     probe_allproc();
 
-    out("\n--- fin ---\n");
-    out("Envoie-moi kstuff_probe.txt\n");
+    out("\n================================\n");
+    out("  C'EST FINI JOHNNY L'OGNION !\n");
+    out("  la tete de boule est en securite\n");
+    out("  -> envoie-moi kstuff_probe.txt\n");
+    out("================================\n");
     log_flush();
 
 fin:
-    /* petite pause puis on rend la main : la console redevient normale,
+    /* pause puis on rend la main : la console redevient normale,
        ce qui permet un arret PROPRE par le menu (protection du SSD). */
     {
         static long ts[2] = { 3, 0 };
