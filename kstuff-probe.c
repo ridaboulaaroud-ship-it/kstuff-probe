@@ -1,23 +1,31 @@
 /* kstuff-probe.c — payload autonome PS5 : dump noyau + scan de candidats
- * Lecture seule, aucun patch. Charge sur le port 9021 apres l'exploit.
+ * 100% lecture seule cote noyau. Ecrit uniquement sur la cle USB.
+ * Se termine proprement (pas de boucle infinie) pour un arret propre.
  */
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
 
-#define VER      "probe-1.2"
+#define VER      "probe-1.4"
 #define LOG_NAME "kstuff_probe.txt"
+
+/* Tailles de dump si l'exploit ne les fournit pas.
+   Baisse-les (ex. 0x1000000 / 0x2000000) pour ecrire moins de donnees. */
+#define DUMP_TEXT_DEF 0x2000000   /* 32 Mo */
+#define DUMP_DATA_DEF 0x4000000   /* 64 Mo */
 
 /* ---------------- memoire (pas de libc) ---------------- */
 void *memcpy(void *d, const void *s, size_t n);
 void *memset(void *d, int c, size_t n);
 int   memcmp(const void *a, const void *b, size_t n);
 
+__attribute__((no_builtin("memcpy")))
 void *memcpy(void *d, const void *s, size_t n) {
     uint8_t *dd = (uint8_t *)d; const uint8_t *ss = (const uint8_t *)s;
     while (n--) *dd++ = *ss++;
     return d;
 }
+__attribute__((no_builtin("memset")))
 void *memset(void *d, int c, size_t n) {
     uint8_t *dd = (uint8_t *)d;
     while (n--) *dd++ = (uint8_t)c;
@@ -41,23 +49,34 @@ static long ksys(long n, long a, long b, long c, long d, long e, long f) {
                      : "rcx", "r11", "memory");
     return ret;
 }
+#define SYS_exit  1
 #define SYS_write 4
-#define SYS_open 5
+#define SYS_open  5
 #define SYS_close 6
 #define SYS_nanosleep 240
 #define SYS_jailbreak 599
 #define O_WRONLY 0x1
+#define O_APPEND 0x8
 #define O_CREAT  0x200
 #define O_TRUNC  0x400
 
 /* ---------------- sortie ---------------- */
 static long g_log = -1;
+static char g_logp[128];
 
 static void out(const char *s) {
     size_t k = 0; while (s[k]) k++;
     ksys(SYS_write, 1, (long)s, k, 0, 0, 0);
     if (g_log >= 0) ksys(SYS_write, g_log, (long)s, k, 0, 0, 0);
 }
+
+/* ferme puis rouvre : garantit que tout est ecrit sur la cle avant la suite */
+static void log_open(int trunc) {
+    if (g_log >= 0) { ksys(SYS_close, g_log, 0, 0, 0, 0, 0); g_log = -1; }
+    g_log = ksys(SYS_open, (long)g_logp, O_WRONLY|O_CREAT|(trunc ? O_TRUNC : O_APPEND),
+                 0644, 0, 0, 0);
+}
+#define log_flush() log_open(0)
 
 static void outx(uint64_t v) {
     char b[24]; int i = 24; b[--i] = 0;
@@ -103,7 +122,6 @@ struct kstuff_api {
 static struct {
     uint64_t kern_base, data_base, text_size, data_size;
     int (*kread)(uint64_t, void *, size_t);
-    int (*kwrite)(uint64_t, const void *, size_t);
 } K;
 
 static int kread(void *dst, uint64_t addr, size_t n) {
@@ -206,7 +224,7 @@ static void mkelf(const char *name, uint64_t vaddr, uint64_t size) {
     struct ehdr e; memset(&e, 0, sizeof e);
     e.ident[0]=0x7f; e.ident[1]='E'; e.ident[2]='L'; e.ident[3]='F';
     e.ident[4]=2; e.ident[5]=1; e.ident[6]=1;
-    e.type=2; e.machine=62;
+    e.type=2; e.machine=62; e.version=1;
     e.phoff=sizeof e; e.ehsize=sizeof e;
     e.phentsize=sizeof(struct phdr); e.phnum=1;
 
@@ -299,8 +317,7 @@ static void probe_allproc(void) {
 /* ---------------- entree ---------------- */
 void _start(void) {
     out("\n================================\n");
-    out("  kstuff probe " VER "\n");
-    out("  lecture seule, aucun patch\n");
+    out("  kstuff probe " VER "  (lecture seule)\n");
     out("================================\n\n");
 
     g_dir = "/mnt/usb0/";
@@ -308,23 +325,26 @@ void _start(void) {
     if (t >= 0) ksys(SYS_close, t, 0, 0, 0, 0, 0);
     else g_dir = "/data/";
 
-    char logp[128];
-    join_path(logp, g_dir, LOG_NAME);
-    g_log = ksys(SYS_open, (long)logp, O_WRONLY|O_CREAT|O_TRUNC, 0644, 0, 0, 0);
-
+    join_path(g_logp, g_dir, LOG_NAME);
+    log_open(1);
     kprintf("sortie : %s\n", g_dir);
 
     struct kstuff_api *api = (struct kstuff_api *)ksys(SYS_jailbreak, 0, 0, 0, 0, 0, 0);
+    kprintf("jailbreak() -> %p\n", (uint64_t)api);
     if (!api || !api->kread) {
-        out("!! jailbreak() indisponible : lance l'exploit AVANT ce payload\n");
+        out("!! pas de R/W noyau : lance l'exploit AVANT ce payload\n");
+        log_flush();
         goto fin;
     }
+
     K.kern_base = api->kern_base;
     K.data_base = api->data_base;
-    K.text_size = api->text_size ? api->text_size : 0x2000000;
-    K.data_size = api->data_size ? api->data_size : 0x4000000;
-    K.kread = api->kread;
-    K.kwrite = api->kwrite;
+    K.text_size = api->text_size;
+    K.data_size = api->data_size;
+    K.kread     = api->kread;
+
+    if (K.text_size < 0x100000 || K.text_size > 0x8000000) K.text_size = DUMP_TEXT_DEF;
+    if (K.data_size < 0x100000 || K.data_size > 0x8000000) K.data_size = DUMP_DATA_DEF;
 
     out("\n--- bases ---\n");
     kprintf("kern_base       %p\n", K.kern_base);
@@ -334,19 +354,46 @@ void _start(void) {
     kprintf("idt (sidt)      %p\n", idt_get());
     kprintf("cr3 (pml4)      %p\n", cr3_get());
 
+    if ((K.kern_base >> 32) != 0xffffffffULL)
+        out("!! kern_base ne ressemble pas a une adresse noyau\n");
+    if (K.data_base < K.kern_base)
+        out("!! data_base < kern_base : structure inattendue\n");
+
+    {
+        uint8_t test[16];
+        if (kread(test, K.kern_base, 16) == 0) {
+            out("test lecture kern_base : ");
+            for (int i = 0; i < 16; i++) { outx(test[i]); out(" "); }
+            out("\n");
+        } else out("test lecture kern_base : ECHEC\n");
+    }
+
+    log_flush();
+
     out("\n--- dump noyau ---\n");
     mkelf("kernel_text.elf", K.kern_base, K.text_size);
+    log_flush();
     mkelf("kernel_data.elf", K.data_base, K.data_size);
+    log_flush();
 
     probe_crypto();
+    log_flush();
     probe_strings();
+    log_flush();
     probe_allproc();
 
     out("\n--- fin ---\n");
     out("Envoie-moi kstuff_probe.txt\n");
+    log_flush();
 
 fin:
-    if (g_log >= 0) ksys(SYS_close, g_log, 0, 0, 0, 0, 0);
+    /* petite pause puis on rend la main : la console redevient normale,
+       ce qui permet un arret PROPRE par le menu (protection du SSD). */
+    {
+        static long ts[2] = { 3, 0 };
+        ksys(SYS_nanosleep, (long)ts, 0, 0, 0, 0, 0);
+    }
+    ksys(SYS_exit, 0, 0, 0, 0, 0, 0);
     for (;;) {
         static long ts[2] = { 1, 0 };
         ksys(SYS_nanosleep, (long)ts, 0, 0, 0, 0, 0);
