@@ -5,8 +5,29 @@
 #include <stddef.h>
 #include <stdbool.h>
 
-#define VER      "probe-1.1"
+#define VER      "probe-1.2"
 #define LOG_NAME "kstuff_probe.txt"
+
+/* ---------------- memoire (pas de libc) ---------------- */
+void *memcpy(void *d, const void *s, size_t n);
+void *memset(void *d, int c, size_t n);
+int   memcmp(const void *a, const void *b, size_t n);
+
+void *memcpy(void *d, const void *s, size_t n) {
+    uint8_t *dd = (uint8_t *)d; const uint8_t *ss = (const uint8_t *)s;
+    while (n--) *dd++ = *ss++;
+    return d;
+}
+void *memset(void *d, int c, size_t n) {
+    uint8_t *dd = (uint8_t *)d;
+    while (n--) *dd++ = (uint8_t)c;
+    return d;
+}
+int memcmp(const void *a, const void *b, size_t n) {
+    const uint8_t *x = (const uint8_t *)a, *y = (const uint8_t *)b;
+    while (n--) { if (*x != *y) return (int)*x - (int)*y; x++; y++; }
+    return 0;
+}
 
 /* ---------------- syscalls ---------------- */
 static long ksys(long n, long a, long b, long c, long d, long e, long f) {
@@ -91,13 +112,13 @@ static int kread(void *dst, uint64_t addr, size_t n) {
 }
 
 /* ---------------- utilitaires ---------------- */
-static uint64_t rd64(const uint8_t *p) { uint64_t v; __builtin_memcpy(&v, p, 8); return v; }
+static uint64_t rd64(const uint8_t *p) { uint64_t v; memcpy(&v, p, 8); return v; }
 
 static int kmemmem(const uint8_t *h, size_t hn, const char *s) {
     size_t sl = 0; while (s[sl]) sl++;
     if (!sl || sl > hn) return 0;
     for (size_t i = 0; i + sl <= hn; i++)
-        if (__builtin_memcmp(h + i, s, sl) == 0) return 1;
+        if (memcmp(h + i, s, sl) == 0) return 1;
     return 0;
 }
 
@@ -182,14 +203,14 @@ static void mkelf(const char *name, uint64_t vaddr, uint64_t size) {
     long fd = ksys(SYS_open, (long)path, O_WRONLY|O_CREAT|O_TRUNC, 0644, 0, 0, 0);
     if (fd < 0) { kprintf("dump KO: %s\n", path); return; }
 
-    struct ehdr e; __builtin_memset(&e, 0, sizeof e);
+    struct ehdr e; memset(&e, 0, sizeof e);
     e.ident[0]=0x7f; e.ident[1]='E'; e.ident[2]='L'; e.ident[3]='F';
     e.ident[4]=2; e.ident[5]=1; e.ident[6]=1;
     e.type=2; e.machine=62;
     e.phoff=sizeof e; e.ehsize=sizeof e;
     e.phentsize=sizeof(struct phdr); e.phnum=1;
 
-    struct phdr p; __builtin_memset(&p, 0, sizeof p);
+    struct phdr p; memset(&p, 0, sizeof p);
     p.type=1; p.flags=5;
     p.offset=0x1000; p.vaddr=vaddr; p.paddr=vaddr;
     p.filesz=size; p.memsz=size; p.align=0x1000;
