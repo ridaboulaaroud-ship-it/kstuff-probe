@@ -51,12 +51,18 @@ static void kprintf(const char *f, ...) {
     for (; *f; f++) {
         if (*f != '%') { char c[2] = { *f, 0 }; out(c); continue; }
         f++;
+        /* saute drapeaux et largeurs : %-24s, %#lx, %02x ... */
+        while (*f == '#' || *f == '-' || *f == '+' || *f == ' ' || *f == '0' ||
+               (*f >= '1' && *f <= '9') || *f == 'l' || *f == 'h' || *f == 'z')
+            f++;
         switch (*f) {
             case 's': out(__builtin_va_arg(ap, const char *)); break;
-            case 'd': outd(__builtin_va_arg(ap, int)); break;
+            case 'd': case 'i': outd(__builtin_va_arg(ap, int)); break;
+            case 'u': outx((uint64_t)__builtin_va_arg(ap, unsigned), 0); break;
             case 'x': outx(__builtin_va_arg(ap, uint64_t), 0); break;
             case 'p': out("0x"); outx(__builtin_va_arg(ap, uint64_t), 0); break;
             case '%': out("%"); break;
+            case 0: __builtin_va_end(ap); return;
         }
     }
     __builtin_va_end(ap);
@@ -159,7 +165,7 @@ static void mkelf(const char *name, uint64_t vaddr, uint64_t size) {
     for (int i = 0; name[i]; i++) path[n++] = name[i];
     path[n] = 0;
 
-    long fd = ksys(SYS_open, (long)path, O_WRONLY|O_CREAT|O_TRUNC, 0644, 0, 0);
+    long fd = ksys(SYS_open, (long)path, O_WRONLY|O_CREAT|O_TRUNC, 0644, 0, 0, 0);
     if (fd < 0) { kprintf("dump KO: %s\n", path); return; }
 
     struct ehdr e; __builtin_memset(&e, 0, sizeof e);
@@ -256,53 +262,9 @@ void _start(void) {
     out("================================\n\n");
 
     g_dir = "/mnt/usb0/";
-    long t = ksys(SYS_open, (long)"/mnt/usb0/.probe", O_WRONLY|O_CREAT, 0644, 0, 0);
+    long t = ksys(SYS_open, (long)"/mnt/usb0/.probe", O_WRONLY|O_CREAT, 0644, 0, 0, 0);
     if (t >= 0) ksys(SYS_close, t, 0,0,0,0,0); else g_dir = "/data/";
 
     char logp[128]; int n = 0;
     while (g_dir[n]) { logp[n] = g_dir[n]; n++; }
-    const char *ln = "kstuff_probe.txt";
-    for (int i = 0; ln[i]; i++) logp[n++] = ln[i];
-    logp[n] = 0;
-    g_log = ksys(SYS_open, (long)logp, O_WRONLY|O_CREAT|O_TRUNC, 0644, 0, 0);
-
-    kprintf("sortie : %s\n", g_dir);
-
-    struct kstuff_api *api = (struct kstuff_api *)ksys(SYS_jailbreak, 0,0,0,0,0,0);
-    if (!api || !api->kread) {
-        out("!! jailbreak() indisponible : lance l'exploit AVANT ce payload\n");
-        goto fin;
-    }
-    K.kern_base = api->kern_base;
-    K.data_base = api->data_base;
-    K.text_size = api->text_size ? api->text_size : 0x2000000;
-    K.data_size = api->data_size ? api->data_size : 0x4000000;
-    K.kread = api->kread;
-    K.kwrite = api->kwrite;
-
-    out("\n--- bases ---\n");
-    kprintf("kern_base   %p\n", K.kern_base);
-    kprintf("data_base   %p\n", K.data_base);
-    kprintf("text_size   %#lx\n", K.text_size);
-    kprintf("data_size   %#lx\n", K.data_size);
-    kprintf("idt (sidt)  %p\n", idt_get());
-    kprintf("cr3 (pml4)  %p\n", cr3_get());
-
-    out("\n--- dump noyau ---\n");
-    mkelf("kernel_text.elf", K.kern_base, K.text_size);
-    mkelf("kernel_data.elf", K.data_base, K.data_size);
-
-    probe_crypto();
-    probe_strings();
-    probe_allproc();
-
-    out("\n--- fin ---\n");
-    out("Envoie-moi kstuff_probe.txt\n");
-
-fin:
-    if (g_log >= 0) ksys(SYS_close, g_log, 0,0,0,0,0);
-    for (;;) {
-        static long ts[2] = { 1, 0 };
-        ksys(SYS_nanosleep, (long)ts, 0,0,0,0,0);
-    }
-}
+    const char *ln =
