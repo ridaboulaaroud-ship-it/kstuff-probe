@@ -1,37 +1,47 @@
-name: build-probe
-on: [push, workflow_dispatch]
+name: build
+
+on:
+  push:
+  workflow_dispatch:
+
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - name: Recuperer le depot
+        uses: actions/checkout@v4
 
-      - name: Installer les outils
+      - name: Installer les dependances
         run: |
           sudo apt-get update
-          sudo apt-get install -y git build-essential clang lld cmake ninja-build curl xz-utils python3
+          sudo apt-get install -y bash socat cmake pkg-config xxd wget curl \
+            python3 python3-pyelftools libssl-dev zlib1g-dev
+          sudo apt-get install -y clang-15 lld-15 llvm-15 || sudo apt-get install -y clang lld llvm
+          if command -v llvm-config-15 >/dev/null 2>&1; then
+            echo "LLVM_CONFIG=llvm-config-15" >> "$GITHUB_ENV"
+          fi
 
       - name: Recuperer le SDK PS5
         run: |
-          set -e
-          git clone --depth 1 https://github.com/john-tornblom/ps5-payload-sdk "$HOME/sdk"
-          cd "$HOME/sdk"
-          if [ -f build.sh ]; then chmod +x build.sh; ./build.sh; else make; fi
+          git clone --depth 1 https://github.com/ps5-payload-dev/sdk.git "$GITHUB_WORKSPACE/sdk"
 
-      - name: Verifier le SDK
+      - name: Compiler le SDK PS5
         run: |
-          ls -l "$HOME/sdk/bin" || true
+          make -C "$GITHUB_WORKSPACE/sdk"
+          make -C "$GITHUB_WORKSPACE/sdk" DESTDIR="$GITHUB_WORKSPACE/ps5sdk" install
+          echo "PS5_PAYLOAD_SDK=$GITHUB_WORKSPACE/ps5sdk" >> "$GITHUB_ENV"
 
       - name: Compiler le payload
-        env:
-          PS5_PAYLOAD_SDK: /home/runner/sdk
         run: make
 
       - name: Verifier le resultat
-        run: ls -lh kstuff-probe.elf
+        run: |
+          ls -l kstuff-probe.elf
+          file kstuff-probe.elf || true
 
-      - name: Publier l'artifact
+      - name: Publier l artefact
         uses: actions/upload-artifact@v4
         with:
-          name: kstuff-probe.elf
+          name: kstuff-probe-elf
           path: kstuff-probe.elf
+          if-no-files-found: error
