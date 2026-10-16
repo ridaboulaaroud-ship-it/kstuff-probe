@@ -1,3 +1,4 @@
+
 name: build
 
 on:
@@ -7,6 +8,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-22.04
+
     steps:
       - name: Recuperer le depot
         uses: actions/checkout@v4
@@ -14,30 +16,30 @@ jobs:
       - name: Installer les dependances
         run: |
           sudo apt-get update
-          sudo apt-get install -y bash socat cmake pkg-config xxd wget curl \
+          sudo apt-get install -y bash socat cmake meson pkg-config xxd wget curl unzip \
             python3 python3-pyelftools libssl-dev zlib1g-dev
-          sudo apt-get install -y clang-15 lld-15 llvm-15 || sudo apt-get install -y clang lld llvm
-          if command -v llvm-config-15 >/dev/null 2>&1; then
-            echo "LLVM_CONFIG=llvm-config-15" >> "$GITHUB_ENV"
-          fi
 
-      - name: Recuperer le SDK PS5
+      - name: Installer le SDK PS5 officiel
         run: |
-          git clone --depth 1 https://github.com/ps5-payload-dev/sdk.git "$GITHUB_WORKSPACE/sdk"
+          wget -q https://github.com/ps5-payload-dev/sdk/releases/latest/download/ps5-payload-sdk.zip \
+            -O "$RUNNER_TEMP/ps5-payload-sdk.zip"
+          sudo unzip -q "$RUNNER_TEMP/ps5-payload-sdk.zip" -d /opt
+          echo "PS5_PAYLOAD_SDK=/opt/ps5-payload-sdk" >> "$GITHUB_ENV"
 
-      - name: Compiler le SDK PS5
+      - name: Verifier le SDK
         run: |
-          make -C "$GITHUB_WORKSPACE/sdk"
-          make -C "$GITHUB_WORKSPACE/sdk" DESTDIR="$GITHUB_WORKSPACE/ps5sdk" install
-          echo "PS5_PAYLOAD_SDK=$GITHUB_WORKSPACE/ps5sdk" >> "$GITHUB_ENV"
+          test -f "$PS5_PAYLOAD_SDK/toolchain/prospero.mk" || \
+          test -f "$PS5_PAYLOAD_SDK/lib/prospero.mk"
+          find "$PS5_PAYLOAD_SDK" -maxdepth 3 \
+            \( -name 'prospero-clang' -o -name 'prospero.mk' \) -print
 
       - name: Compiler le payload
         run: make
 
       - name: Verifier le resultat
         run: |
-          ls -l kstuff-probe.elf
-          file kstuff-probe.elf || true
+          test -s kstuff-probe.elf
+          file kstuff-probe.elf
 
       - name: Publier l artefact
         uses: actions/upload-artifact@v4
