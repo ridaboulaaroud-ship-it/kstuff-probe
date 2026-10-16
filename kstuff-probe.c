@@ -1,514 +1,747 @@
-/* kstuff-probe.c — payload autonome PS5 : dump noyau + scan de candidats
- * 100% lecture seule cote noyau. Ecrit en priorite sur la cle USB.
- * Se termine proprement pour permettre un arret propre de la console.
+/*
+ * kstuff-probe.c -- v3.9
+ *
+ * PHASE 1 (defaut) : args, firmware, bases, lectures brutes, parcours allproc.
+ *                    Les points [8] a [12] ne sont PAS compiles.
+ * PHASE 2          : + scan des ancres + test isole du syscall 599.
+ * PHASE 3          : + dump brut.
+ *
+ * Statuts : 1 = OK, 0 = KO, 2 = TRONQUE, -1 = non evalue.
+ *
+ * Faits verifies dans le source du SDK (ps5-payload-dev/sdk) :
+ *   - kernel_copyout() : 0 = succes, -1 = echec. Aucun compte d'octets.
+ *     Pipe arme avec cnt = in = 0x40000000 : SYS_read(n) rend n octets.
+ *   - KERNEL_ADDRESS_ALLPROC contient un pointeur direct vers le premier
+ *     struct proc ; lien de liste a l'offset 0 ; p_pid a 0xBC ; la liste se
+ *     termine sur un lien NUL (c'est ce que fait kernel_get_proc()).
+ *   - kernel_get_fw_version() : SYS_dynlib_get_obj_member(0x2, 8), sans pipe.
+ *
+ * LIMITES ASSUMEES :
+ *   - fw_table[] recopie la table du SDK : detecteur d'incoherence, pas
+ *     validation independante.
+ *   - [7] est un RECOUPEMENT : kernel_get_proc() et notre parcours tournent
+ *     dans le meme environnement noyau. Ce n'est pas une preuve independante.
+ *   - [4c] effectue une VRAIE lecture noyau et peut parfaitement reussir.
+ *     Ce qui est "hors verdict" n'est pas la lecture, c'est son ROLE.
+ *   - La validation operationnelle RETENUE POUR LE VERDICT repose donc
+ *     uniquement sur [4a] et [4b].
  */
+
+#include <errno.h>
+#include <fcntl.h>
+#include <stdarg.h>
 #include <stdint.h>
-#include <stddef.h>
-#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/syscall.h>
 
-#define VER      "probe-1.8"
-#define LOG_NAME "kstuff_probe.txt"
+#include <ps5/kernel.h>
+#include <ps5/klog.h>
+#include <ps5/payload.h>
 
-#define DUMP_TEXT_DEF 0x2000000   /* 32 Mo */
-#define DUMP_DATA_DEF 0x4000000   /* 64 Mo */
+#define PROBE_VERSION   "3.9"
+#define LOG_NAME        "kstuff_probe.txt"
 
-/* cr3 n'est qu'informatif. Mets 0 pour zero risque.
-   Si la lecture est refusee, seule la fin du payload s'arrete (SIGILL),
-   la console n'est pas affectee. */
-#define READ_CR3 1
+#define PHASE           1
 
-/* ---------------- memoire (pas de libc) ---------------- */
-void *memcpy(void *d, const void *s, size_t n);
-void *memset(void *d, int c, size_t n);
-int   memcmp(const void *a, const void *b, size_t n);
+#define KREAD_CHUNK     4096u
+#define SCAN_CHUNK      8192u
+#define SCAN_TEXT_SIZE  (32u * 1024u * 1024u)
+#define SCAN_DATA_SIZE  ( 8u * 1024u * 1024u)
+#define WALK_MAX        256
 
-__attribute__((no_builtin("memcpy")))
-void *memcpy(void *d, const void *s, size_t n) {
-    uint8_t *dd = (uint8_t *)d; const uint8_t *ss = (const uint8_t *)s;
-    while (n--) *dd++ = *ss++;
-    return d;
-}
-__attribute__((no_builtin("memset")))
-void *memset(void *d, int c, size_t n) {
-    uint8_t *dd = (uint8_t *)d;
-    while (n--) *dd++ = (uint8_t)c;
-    return d;
-}
-int memcmp(const void *a, const void *b, size_t n) {
-    const uint8_t *x = (const uint8_t *)a, *y = (const uint8_t *)b;
-    while (n--) { if (*x != *y) return (int)*x - (int)*y; x++; y++; }
-    return 0;
-}
+/* etats de test */
+#define ST_OK      1
+#define ST_KO      0
+#define ST_TRUNC   2
+#define ST_NA     -1
 
-/* ---------------- syscalls ---------------- */
-static long ksys(long n, long a, long b, long c, long d, long e, long f) {
-    register long r10 __asm__("r10") = d;
-    register long r8  __asm__("r8")  = e;
-    register long r9  __asm__("r9")  = f;
-    long ret;
-    __asm__ volatile("syscall" : "=a"(ret)
-                     : "a"(n), "D"(a), "S"(b), "d"(c),
-                       "r"(r10), "r"(r8), "r"(r9)
-                     : "rcx", "r11", "memory");
-    return ret;
-}
-#define SYS_exit  1
-#define SYS_write 4
-#define SYS_open  5
-#define SYS_close 6
-#define SYS_nanosleep 240
-#define SYS_jailbreak 599
-#define O_WRONLY 0x1
-#define O_APPEND 0x8
-#define O_CREAT  0x200
-#define O_TRUNC  0x400
+/* niveaux de verdict */
+#define V_FULL        3
+#define V_PARTIAL     2
+#define V_NO_PID      1
+#define V_INCOMPLETE  0
 
-/* ---------------- sortie ---------------- */
-static long g_log = -1;
-static char g_logp[128];
+/* codes de sortie -- convention explicite, ecrite aussi dans le journal */
+#define RC_FULL        0
+#define RC_PARTIAL     2
+#define RC_NO_PID      3
+#define RC_INCOMPLETE  1
 
-static void out(const char *s) {
-    size_t k = 0; while (s[k]) k++;
-    ksys(SYS_write, 1, (long)s, k, 0, 0, 0);
-    if (g_log >= 0) ksys(SYS_write, g_log, (long)s, k, 0, 0, 0);
+static int  g_fd  = -1;
+static char g_dir[64] = "/data";
+
+static const char *st2s(int s) {
+  switch (s) {
+  case ST_OK:    return "OK";
+  case ST_KO:    return "KO";
+  case ST_TRUNC: return "TRONQUE";
+  case ST_NA:    return "non evalue";
+  default:       return "?";
+  }
 }
 
-static void log_open(int trunc) {
-    if (g_log >= 0) { ksys(SYS_close, g_log, 0, 0, 0, 0, 0); g_log = -1; }
-    g_log = ksys(SYS_open, (long)g_logp, O_WRONLY|O_CREAT|(trunc ? O_TRUNC : O_APPEND),
-                 0644, 0, 0, 0);
-}
-#define log_flush() log_open(0)
 
-static void outx(uint64_t v) {
-    char b[24]; int i = 24; b[--i] = 0;
-    if (!v) b[--i] = '0';
-    while (v && i) { b[--i] = "0123456789abcdef"[v & 15]; v >>= 4; }
-    out(&b[i]);
-}
+/* ------------------------------------------------------------------ */
+/* sortie                                                             */
+/* ------------------------------------------------------------------ */
 
-static void outd(int64_t v) {
-    if (v < 0) { out("-"); v = -v; }
-    outx((uint64_t)v);
+static int write_all(int fd, const void *b, size_t n) {
+  const uint8_t *p = (const uint8_t *)b;
+  while (n) {
+    ssize_t r = write(fd, p, n);
+    if (r <= 0) return -1;
+    p += r;
+    n -= (size_t)r;
+  }
+  return 0;
 }
 
-static void kprintf(const char *f, ...) {
-    __builtin_va_list ap; __builtin_va_start(ap, f);
-    for (; *f; f++) {
-        if (*f != '%') { char c[2] = { *f, 0 }; out(c); continue; }
-        f++;
-        while (*f == '#' || *f == '-' || *f == '+' || *f == ' ' || *f == '0' ||
-               (*f >= '1' && *f <= '9') || *f == 'l' || *f == 'h' || *f == 'z')
-            f++;
-        switch (*f) {
-            case 's': out(__builtin_va_arg(ap, const char *)); break;
-            case 'd': case 'i': outd(__builtin_va_arg(ap, int)); break;
-            case 'u': outx((uint64_t)__builtin_va_arg(ap, unsigned)); break;
-            case 'x': outx(__builtin_va_arg(ap, uint64_t)); break;
-            case 'p': out("0x"); outx(__builtin_va_arg(ap, uint64_t)); break;
-            case '%': out("%"); break;
-            case 0: __builtin_va_end(ap); return;
-        }
+static void logf(const char *fmt, ...) {
+  char buf[768];
+  size_t l;
+  va_list ap;
+
+  va_start(ap, fmt);
+  vsnprintf(buf, sizeof(buf), fmt, ap);
+  va_end(ap);
+
+  if (g_fd >= 0) write_all(g_fd, buf, strlen(buf));
+  fputs(buf, stdout);
+
+  l = strlen(buf);
+  if (l && buf[l - 1] == '\n') buf[l - 1] = 0;
+  if (buf[0]) klog_puts(buf);
+}
+
+static const char *open_log(void) {
+  static const char *dirs[] = {
+    "/mnt/usb0", "/mnt/usb1", "/mnt/usb2", "/mnt/usb3", "/data"
+  };
+  static char path[160];
+
+  for (unsigned i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++) {
+    int fd;
+    snprintf(path, sizeof(path), "%s/%s", dirs[i], LOG_NAME);
+    fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (fd >= 0) {
+      g_fd = fd;
+      snprintf(g_dir, sizeof(g_dir), "%s", dirs[i]);
+      return path;
     }
-    __builtin_va_end(ap);
+  }
+  return 0;
 }
 
-/* ---------------- etat noyau ---------------- */
-struct kstuff_api {
-    uint64_t kern_base, data_base, text_size, data_size;
-    int (*kread)(uint64_t, void *, size_t);
-    int (*kwrite)(uint64_t, const void *, size_t);
-    int (*kcall)(uint64_t, uint64_t *, int, uint64_t *);
+
+/* ------------------------------------------------------------------ */
+/* lecture noyau                                                      */
+/* ------------------------------------------------------------------ */
+
+static int kread(intptr_t kaddr, void *buf, size_t len) {
+  uint8_t *p = (uint8_t *)buf;
+
+  while (len) {
+    size_t n = len < KREAD_CHUNK ? len : KREAD_CHUNK;
+    int tries = 0;
+
+    for (;;) {
+      if (kernel_copyout(kaddr, p, n) == 0) break;
+      if (++tries > 2) return -1;
+    }
+
+    p += n;
+    kaddr += n;
+    len -= n;
+  }
+  return 0;
+}
+
+static void hexdump(const char *what, intptr_t addr, const uint8_t *b, size_t n) {
+  logf("    %s @ 0x%016lx\n", what, (unsigned long)(uintptr_t)addr);
+  for (size_t i = 0; i < n; i += 16) {
+    char line[160];
+    int  p = snprintf(line, sizeof(line), "      %08lx  ",
+                      (unsigned long)((uintptr_t)addr + i));
+    for (size_t j = 0; j < 16 && i + j < n; j++)
+      p += snprintf(line + p, sizeof(line) - (size_t)p, "%02x ", b[i + j]);
+    logf("%s\n", line);
+  }
+}
+
+
+/* ------------------------------------------------------------------ */
+/* phase 2 : ancres                                                   */
+/* ------------------------------------------------------------------ */
+
+#if PHASE >= 2
+typedef struct {
+  const char    *name;
+  const uint8_t *pat;
+  size_t         len;
+  intptr_t       hit;
+  intptr_t       region_base;
+  const char    *region;
+  int            found;
+} anchor_t;
+
+static const uint8_t pat_aes_sbox[16] = {
+  0x63,0x7c,0x77,0x7b,0xf2,0x6b,0x6f,0xc5,
+  0x30,0x01,0x67,0x2b,0xfe,0xd7,0xab,0x76
 };
 
-static struct {
-    uint64_t kern_base, data_base, text_size, data_size;
-    int (*kread)(uint64_t, void *, size_t);
-} K;
-
-static int kread(void *dst, uint64_t addr, size_t n) {
-    if (K.kread) return K.kread(addr, dst, n);
-    return -1;
-}
-
-/* ---------------- utilitaires ---------------- */
-static uint64_t rd64(const uint8_t *p) { uint64_t v; memcpy(&v, p, 8); return v; }
-
-static int kmemmem(const uint8_t *h, size_t hn, const char *s) {
-    size_t sl = 0; while (s[sl]) sl++;
-    if (!sl || sl > hn) return 0;
-    for (size_t i = 0; i + sl <= hn; i++)
-        if (memcmp(h + i, s, sl) == 0) return 1;
-    return 0;
-}
-
-static void join_path(char *dst, const char *dir, const char *name) {
-    int i = 0;
-    while (dir[i]) { dst[i] = dir[i]; i++; }
-    for (int j = 0; name[j]; j++) dst[i++] = name[j];
-    dst[i] = 0;
-}
-
-/* ---------------- choix du dossier de sortie ---------------- */
-static const char *g_dir = "/mnt/usb0/";
-static int g_internal = 0;
-
-static int dir_ok(const char *dir) {
-    char p[64];
-    join_path(p, dir, ".kstuff");
-    long fd = ksys(SYS_open, (long)p, O_WRONLY|O_CREAT, 0644, 0, 0, 0);
-    if (fd < 0) return 0;
-    ksys(SYS_close, fd, 0, 0, 0, 0, 0);
-    return 1;
-}
-
-static void pick_dir(void) {
-    static const char *cand[] = { "/mnt/usb0/", "/mnt/usb1/", "/mnt/usb2/", "/mnt/usb3/" };
-    for (int i = 0; i < 4; i++)
-        if (dir_ok(cand[i])) { g_dir = cand[i]; g_internal = 0; return; }
-    g_dir = "/data/";
-    g_internal = 1;
-}
-
-static uint64_t idt_get(void) {
-    struct { uint16_t l; uint64_t b; } __attribute__((packed)) r;
-    __asm__ volatile("sidt %0" : "=m"(r));
-    return r.b;
-}
-
-static uint64_t cr3_get(void) {
-    uint64_t v; __asm__ volatile("mov %%cr3,%0" : "=r"(v)); return v;
-}
-
-/* ---------------- scanner ---------------- */
-static uint8_t g_buf[0x10000 + 0x40];
-
-struct pat { const uint8_t *pat; size_t len; const char *name; uint64_t found; };
-
-static void scan_all(struct pat *list, int n, uint64_t start, uint64_t end)
-{
-    for (uint64_t base = start; base + 16 <= end; base += 0x10000) {
-        size_t n2 = sizeof g_buf;
-        if (base + n2 > end) n2 = end - base;
-        if (n2 < 16) break;
-        if (kread(g_buf, base, n2) != 0) continue;
-
-        int left = 0;
-        for (int k = 0; k < n; k++) {
-            if (list[k].found) continue;
-            left++;
-            const uint8_t *p = list[k].pat;
-            size_t L = list[k].len;
-            for (size_t i = 0; i + L <= n2; i++) {
-                if (g_buf[i] != p[0]) continue;
-                bool ok = true;
-                for (size_t j = 1; j < L; j++)
-                    if (g_buf[i + j] != p[j]) { ok = false; break; }
-                if (ok) { list[k].found = base + i; break; }
-            }
-        }
-        if (!left) break;
-    }
-}
-
-static uint64_t func_start(uint64_t addr) {
-    uint64_t page = addr & ~0xfffULL;
-    for (int k = 0; k < 12 && page >= K.kern_base; k++, page -= 0x1000) {
-        if (kread(g_buf, page, 0x1000) != 0) continue;
-        for (int i = 0x1000 - 4; i >= 0; i--) {
-            if (g_buf[i]==0xF3 && g_buf[i+1]==0x0F && g_buf[i+2]==0x1E && g_buf[i+3]==0xFA)
-                return page + i;
-            if (g_buf[i]==0x55 && g_buf[i+1]==0x48 && g_buf[i+2]==0x89 && g_buf[i+3]==0xE5)
-                return page + i;
-        }
-    }
-    return 0;
-}
-
-static uint64_t fit_range(uint64_t base, uint64_t size) {
-    uint8_t tmp[16];
-    int guard = 0;
-    while (size > 0x100000 && guard++ < 8) {
-        int bad = 0;
-        for (int i = 0; i < 4; i++) {
-            uint64_t a = base + (size / 4) * (uint64_t)i;
-            if (a + 16 > base + size) a = base + size - 16;
-            if (kread(tmp, a, 16) != 0) { bad = 1; break; }
-        }
-        if (!bad) break;
-        size >>= 1;
-    }
-    return size;
-}
-
-/* ---------------- dump ELF ---------------- */
-struct __attribute__((packed)) ehdr {
-    uint8_t ident[16]; uint16_t type, machine; uint32_t version;
-    uint64_t entry, phoff, shoff; uint32_t flags;
-    uint16_t ehsize, phentsize, phnum, shentsize, shnum, shstrndx;
+static const uint8_t pat_aes_inv[16] = {
+  0x52,0x09,0x6a,0xd5,0x30,0x36,0xa5,0x38,
+  0xbf,0x40,0xa3,0x9e,0x81,0xf3,0xd7,0xfb
 };
 
-struct __attribute__((packed)) phdr {
-    uint32_t type, flags;
-    uint64_t offset, vaddr, paddr, filesz, memsz, align;
+static const uint8_t pat_sha_iv_le[32] = {
+  0x67,0xe6,0x09,0x6a, 0x85,0xae,0x67,0xbb,
+  0x72,0xf3,0x6e,0x3c, 0x3a,0xf5,0x4f,0xa5,
+  0x7f,0x52,0x0e,0x51, 0x8c,0x68,0x05,0x9b,
+  0xab,0xd9,0x83,0x1f, 0x19,0xcd,0xe0,0x5b
 };
 
-/* ecrit un bloc et verifie que TOUT a bien ete ecrit */
-static int write_all(long fd, const void *buf, size_t n) {
-    size_t done = 0;
-    while (done < n) {
-        long w = ksys(SYS_write, fd, (long)((const uint8_t *)buf + done), n - done, 0, 0, 0);
-        if (w <= 0) return 0;
-        done += (size_t)w;
-    }
-    return 1;
-}
+static const uint8_t pat_sha_iv_be[32] = {
+  0x6a,0x09,0xe6,0x67, 0xbb,0x67,0xae,0x85,
+  0x3c,0x6e,0xf3,0x72, 0xa5,0x4f,0xf5,0x3a,
+  0x51,0x0e,0x52,0x7f, 0x9b,0x05,0x68,0x8c,
+  0x1f,0x83,0xd9,0xab, 0x5b,0xe0,0xcd,0x19
+};
 
-static void mkelf(const char *name, uint64_t vaddr, uint64_t size) {
-    char path[128];
-    join_path(path, g_dir, name);
+static int scan_region(const char *rname, intptr_t base, size_t size,
+                       anchor_t *an, int nan) {
+  size_t   overlap = 0;
+  uint8_t *buf;
+  size_t   step = SCAN_CHUNK;
+  int      complete = 1;
 
-    long fd = ksys(SYS_open, (long)path, O_WRONLY|O_CREAT|O_TRUNC, 0644, 0, 0, 0);
-    if (fd < 0) { kprintf("dump KO (open): %s\n", path); return; }
+  for (int i = 0; i < nan; i++)
+    if (an[i].len > overlap) overlap = an[i].len;
 
-    struct ehdr e; memset(&e, 0, sizeof e);
-    e.ident[0]=0x7f; e.ident[1]='E'; e.ident[2]='L'; e.ident[3]='F';
-    e.ident[4]=2; e.ident[5]=1; e.ident[6]=1;
-    e.type=2; e.machine=62; e.version=1;
-    e.phoff=sizeof e; e.ehsize=sizeof e;
-    e.phentsize=sizeof(struct phdr); e.phnum=1;
+  if (!(buf = (uint8_t *)malloc(step + 64))) {
+    logf("    [!] malloc echoue pour le scan\n");
+    return 0;
+  }
 
-    struct phdr p; memset(&p, 0, sizeof p);
-    p.type=1; p.flags=5;
-    p.offset=0x1000; p.vaddr=vaddr; p.paddr=vaddr;
-    p.filesz=size; p.memsz=size; p.align=0x1000;
+  for (size_t off = 0; off < size; off += step) {
+    size_t want = size - off;
+    if (want > step + overlap - 1) want = step + overlap - 1;
 
-    if (!write_all(fd, &e, sizeof e)) { out("dump KO (entete)\n"); ksys(SYS_close, fd,0,0,0,0,0); return; }
-    if (!write_all(fd, &p, sizeof p)) { out("dump KO (phdr)\n");  ksys(SYS_close, fd,0,0,0,0,0); return; }
-    static uint8_t pad[0x1000];
-    if (!write_all(fd, pad, 0x1000 - (sizeof e + sizeof p))) {
-        out("dump KO (padding)\n"); ksys(SYS_close, fd,0,0,0,0,0); return;
+    if (kread(base + (intptr_t)off, buf, want)) {
+      logf("    [!] lecture %s +0x%lx echouee, scan interrompu\n",
+           rname, (unsigned long)off);
+      complete = 0;
+      break;
     }
 
-    uint64_t next = 0x800000;
-    int fails = 0, wfails = 0;
-    for (uint64_t off = 0; off < size; off += 0x10000) {
-        size_t n2 = 0x10000;
-        if (off + n2 > size) n2 = size - off;
-        if (kread(g_buf, vaddr + off, n2) != 0) { memset(g_buf, 0, n2); fails++; }
-        if (!write_all(fd, g_buf, n2)) { wfails++; }
-        if (off >= next) { out("."); log_flush(); next += 0x800000; }
-    }
-    ksys(SYS_close, fd, 0, 0, 0, 0, 0);
-    out("\n");
-    kprintf("dump : %s  (%#lx octets @ %p)\n", path, size, vaddr);
-    if (fails)  kprintf("  !! %d bloc(s) illisible(s) remis a zero\n", fails);
-    if (wfails) kprintf("  !! %d ecriture(s) en echec (cle pleine ou debranchee ?)\n", wfails);
-}
-
-/* ---------------- ancres ---------------- */
-static const uint8_t AES_SBOX[16] = {
-    0x63,0x7C,0x77,0x7B,0xF2,0x6B,0x6F,0xC5,
-    0x30,0x01,0x67,0x2B,0xFE,0xD7,0xAB,0x76 };
-
-static const uint8_t SHA256_IV[16] = {
-    0x67,0xE6,0x09,0x6A,0x85,0xAE,0x67,0xBB,
-    0x72,0xF3,0x6E,0x3C,0x3A,0xF5,0x4F,0xA5 };
-
-static void probe_text(void) {
-    static struct pat list[2] = {
-        { AES_SBOX,   16, "aes_sbox",  0 },
-        { SHA256_IV,  16, "sha256_iv", 0 },
-    };
-    list[0].found = 0; list[1].found = 0;
-
-    out("\n--- ancres crypto (1 passe sur .text) ---\n");
-    scan_all(list, 2, K.kern_base, K.kern_base + K.text_size);
-
-    for (int k = 0; k < 2; k++) {
-        if (list[k].found) {
-            kprintf("%s  %p  off %#lx\n", list[k].name,
-                    list[k].found, list[k].found - K.kern_base);
-            uint64_t f = func_start(list[k].found);
-            if (f) kprintf("  -> fonction  %p  off %#lx\n", f, f - K.kern_base);
-        } else kprintf("%s  introuvable\n", list[k].name);
-    }
-}
-
-static void probe_data(void) {
-    static const char *names[] = {
-        "sceSblAuthMgrVerifyHeader", "SceSblAuthMgr", "sceSblAuthMgrIsLoadable",
-        "SceSblPfs", "sceSblPfsCrypt", "a53", "SceA53", "Ppr", "Kraken"
-    };
-    enum { N = sizeof names / sizeof *names };
-    static struct pat list[N];
-
-    for (int i = 0; i < (int)N; i++) {
-        size_t L = 0; while (names[i][L]) L++;
-        list[i].pat = (const uint8_t *)names[i];
-        list[i].len = L;
-        list[i].name = names[i];
-        list[i].found = 0;
-    }
-
-    out("\n--- chaines (1 passe sur .data) ---\n");
-    scan_all(list, (int)N, K.data_base, K.data_base + K.data_size);
-
-    for (int i = 0; i < (int)N; i++) {
-        if (list[i].found) kprintf("%s  %p  off %#lx\n",
-                                   names[i], list[i].found, list[i].found - K.data_base);
-        else               kprintf("%s  (absent)\n", names[i]);
-    }
-}
-
-static void probe_allproc(void) {
-    uint64_t span = K.data_size < 0x800000 ? K.data_size : 0x800000;
-    out("\n--- candidats allproc ---\n");
-    int found = 0, probes = 0;
-    for (uint64_t off = 0; off + 0x10000 <= span; off += 0x10000) {
-        if (kread(g_buf, K.data_base + off, 0x10000) != 0) continue;
-        for (size_t i = 0; i + 8 <= 0x10000; i += 8) {
-            uint64_t p = rd64(g_buf + i);
-            if (p < K.data_base || p > K.data_base + 0x4000000) continue;
-            if (p & 0xf) continue;
-            if (++probes > 30000) { out("(limite de sondage atteinte)\n"); return; }
-            static uint8_t pr[0x300];
-            if (kread(pr, p, sizeof pr) != 0) continue;
-            if (kmemmem(pr, sizeof pr, "kernel") || kmemmem(pr, sizeof pr, "init")) {
-                kprintf("candidat : liste @ %p  -> proc %p  (off %#lx)\n",
-                        K.data_base + off + i, p, (K.data_base + off + i) - K.data_base);
-                if (++found >= 10) return;
-            }
+    for (size_t i = 0; i < want; i++) {
+      for (int a = 0; a < nan; a++) {
+        if (an[a].found) continue;
+        if (an[a].len > want - i) continue;
+        if (buf[i] != an[a].pat[0]) continue;
+        if (!memcmp(buf + i, an[a].pat, an[a].len)) {
+          an[a].found       = 1;
+          an[a].hit         = base + (intptr_t)off + (intptr_t)i;
+          an[a].region_base = base;
+          an[a].region      = rname;
         }
+      }
     }
-    if (!found) out("aucun candidat trouve\n");
+    if (off + step >= size) break;
+  }
+
+  free(buf);
+  return complete;
 }
-
-/* ---------------- entree ---------------- */
-void _start(void) {
-    out("\n================================\n");
-    out("  kstuff probe " VER "  (lecture seule)\n");
-    out("================================\n\n");
-
-    pick_dir();
-    join_path(g_logp, g_dir, LOG_NAME);
-    log_open(1);
-    kprintf("sortie : %s\n", g_dir);
-    if (g_internal) {
-        out("!! PAS DE CLE USB -> ecriture sur le stockage INTERNE\n");
-        out("!! rebranche la cle et relance pour preserver le SSD\n");
-    }
-
-    struct kstuff_api *api = (struct kstuff_api *)ksys(SYS_jailbreak, 0, 0, 0, 0, 0, 0);
-    kprintf("jailbreak() -> %p\n", (uint64_t)api);
-    if (!api || !api->kread) {
-        out("!! pas de R/W noyau : lance l'exploit AVANT ce payload\n");
-        log_flush();
-        goto fin;
-    }
-
-    K.kern_base = api->kern_base;
-    K.data_base = api->data_base;
-    K.text_size = api->text_size;
-    K.data_size = api->data_size;
-    K.kread     = api->kread;
-
-    if (K.text_size < 0x100000 || K.text_size > 0x8000000) K.text_size = DUMP_TEXT_DEF;
-    if (K.data_size < 0x100000 || K.data_size > 0x8000000) K.data_size = DUMP_DATA_DEF;
-
-    out("\n--- bases ---\n");
-    kprintf("kern_base       %p\n", K.kern_base);
-    kprintf("data_base       %p\n", K.data_base);
-    kprintf("text_size       %#lx\n", K.text_size);
-    kprintf("data_size       %#lx\n", K.data_size);
-
-    if ((K.kern_base >> 32) != 0xffffffffULL)
-        out("!! kern_base ne ressemble pas a une adresse noyau\n");
-    if (K.data_base < K.kern_base)
-        out("!! data_base < kern_base : structure inattendue\n");
-
-    /* --- double test de lecture : si LES DEUX echouent, on saute le dump --- */
-    int ok_text = 0, ok_data = 0;
-    {
-        uint8_t test[16];
-        if (kread(test, K.kern_base, 16) == 0) {
-            ok_text = 1;
-            out("test lecture kern_base : ");
-            for (int i = 0; i < 16; i++) { outx(test[i]); out(" "); }
-            out("\n");
-        } else out("test lecture kern_base : ECHEC\n");
-
-        if (kread(test, K.data_base, 16) == 0) {
-            ok_data = 1;
-            out("test lecture data_base : OK\n");
-        } else out("test lecture data_base : ECHEC\n");
-    }
-
-    if (!ok_text && !ok_data) {
-        out("\n!! AUCUNE lecture noyau ne fonctionne\n");
-        out("!! l'API ne correspond pas a ce payload -> dump saute\n");
-        out("!! (96 Mo de donnees fausses ne servent a rien)\n");
-        log_flush();
-        goto fin;
-    }
-    if (!ok_text || !ok_data)
-        out("!! une seule des deux zones repond : resultats a prendre avec prudence\n");
-
-    K.text_size = fit_range(K.kern_base, K.text_size);
-    K.data_size = fit_range(K.data_base, K.data_size);
-
-    if (g_internal) {
-        if (K.text_size > 0x1000000) K.text_size = 0x1000000;   /* 16 Mo */
-        if (K.data_size > 0x2000000) K.data_size = 0x2000000;   /* 32 Mo */
-        out("(stockage interne : tailles reduites)\n");
-    }
-
-    kprintf("plages retenues : text %#lx  data %#lx\n", K.text_size, K.data_size);
-    log_flush();
-
-    out("\n--- dump noyau (points = progression) ---\n");
-    mkelf("kernel_text.elf", K.kern_base, K.text_size);
-    log_flush();
-    mkelf("kernel_data.elf", K.data_base, K.data_size);
-    log_flush();
-
-    probe_text();
-    log_flush();
-    probe_data();
-    log_flush();
-    probe_allproc();
-
-    out("\n================================\n");
-    out("  C'EST FINI JOHNNY L'OGNION !\n");
-    out("  la tete de boule est en securite\n");
-    out("  -> envoie-moi kstuff_probe.txt\n");
-    out("================================\n");
-    log_flush();
-
-    /* --- idt puis cr3, en DERNIER ---
-       Si la lecture de cr3 est refusee en ring 3, le noyau envoie un
-       SIGILL au processus du payload : il s'arrete ICI, mais la console
-       reste allumee et tous les fichiers sont deja ecrits. */
-    out("\n--- registres (en dernier) ---\n");
-    kprintf("idt (sidt)      %p\n", idt_get());
-    log_flush();
-#if READ_CR3
-    out("lecture cr3... (si le payload s'arrete ici, c'est normal)\n");
-    log_flush();
-    kprintf("cr3 (pml4)      %p\n", cr3_get());
-    log_flush();
-#else
-    out("cr3 : desactive par READ_CR3=0\n");
 #endif
 
-fin:
+
+/* ------------------------------------------------------------------ */
+/* phase 3 : dump                                                     */
+/* ------------------------------------------------------------------ */
+
+#if PHASE >= 3
+static int dump_region(const char *fname, intptr_t base, size_t size) {
+  char     path[160];
+  uint8_t *buf;
+  int      fd;
+  size_t   off;
+
+  if (!(buf = (uint8_t *)malloc(KREAD_CHUNK))) {
+    logf("    [!] dump: malloc echoue\n");
+    return 0;
+  }
+
+  snprintf(path, sizeof(path), "%s/%s", g_dir, fname);
+  if ((fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0666)) < 0) {
+    logf("    [!] dump: impossible d'ouvrir %s\n", path);
+    free(buf);
+    return 0;
+  }
+
+  for (off = 0; off < size; off += KREAD_CHUNK) {
+    size_t n = (size - off) < KREAD_CHUNK ? (size - off) : KREAD_CHUNK;
+    if (kread(base + (intptr_t)off, buf, n)) {
+      logf("    [!] dump: lecture echouee a +0x%lx\n", (unsigned long)off);
+      break;
+    }
+    if (write_all(fd, buf, n)) {
+      logf("    [!] dump: ecriture echouee a +0x%lx\n", (unsigned long)off);
+      break;
+    }
+  }
+
+  fsync(fd);
+  close(fd);
+  free(buf);
+  logf("    dump %s : 0x%lx octets ecrits\n", path, (unsigned long)off);
+  return off >= size;
+}
+#endif
+
+
+/* ------------------------------------------------------------------ */
+/* table locale -- recopie de la table du SDK (13.00 -> 13.60)        */
+/* ------------------------------------------------------------------ */
+
+static const struct {
+  uint32_t fw;
+  uint32_t delta;        /* DATA_BASE - TEXT_BASE */
+  uint32_t allproc_off;  /* ALLPROC   - DATA_BASE */
+} fw_table[] = {
+  { 0x13000000u, 0x0cb0000u, 0x28c5e00u },
+  { 0x13200000u, 0x0cb0000u, 0x28c5e00u },
+  { 0x13400000u, 0x0cb0000u, 0x28c9e80u },
+  { 0x13600000u, 0x0cc0000u, 0x28c9e80u },
+};
+
+
+/* ------------------------------------------------------------------ */
+/* main                                                               */
+/* ------------------------------------------------------------------ */
+
+int main(int argc, char **argv) {
+#if PHASE >= 2
+  anchor_t        anchors[4];
+  int             anchors_found = -1;
+#endif
+  payload_args_t *pa;
+  const char     *logpath;
+  uint32_t        fw;
+  uintptr_t       text = 0, data = 0, allproc = 0;
+  uint8_t         probe[64];
+  int             have_pipe;
+  int             st_args = ST_OK, st_fw = ST_OK, st_bases = ST_OK;
+  int             st_read = ST_NA, st_read_c = ST_NA;
+  int             st_walk = ST_NA, st_pid = ST_NA, st_sdk = ST_NA;
+  int             st_scan = ST_NA, st_dump = ST_NA;
+  int             base_ok, core_ok, verdict, rc;
+
+  (void)argc; (void)argv;
+
+  logpath = open_log();
+
+  logf("\n");
+  logf("=====================================================\n");
+  logf(" kstuff-probe v%s -- phase %d\n", PROBE_VERSION, PHASE);
+  logf(" build %s %s\n", __DATE__, __TIME__);
+  logf("=====================================================\n");
+  logf(" log : %s\n",
+       logpath ? logpath : "(aucun fichier, stdout/klog seulement)");
+  logf(" pid : %d\n", (int)getpid());
+#if PHASE < 2
+  logf(" phase %d : les points [8] a [12] ne sont pas compiles.\n", PHASE);
+  logf("            passe #define PHASE 2 pour le scan et le test 599.\n");
+#endif
+
+  /* ---- 1. prerequis ---- */
+  pa = payload_get_args();
+  if (!pa || !pa->rwpipe || !pa->rwpair || !pa->kpipe_addr || !pa->kdata_base_addr) {
+    logf("\n[1] [KO] payload_args absents ou incomplets\n");
+    st_args = ST_KO;
+    have_pipe = 0;
+  } else {
+    logf("\n[1] payload_args recus (presence ; la preuve est en [4a][4b]) :\n");
+    logf("    rwpipe     = %d / %d\n", pa->rwpipe[0], pa->rwpipe[1]);
+    logf("    rwpair     = %d / %d\n", pa->rwpair[0], pa->rwpair[1]);
+    logf("    kpipe_addr = 0x%016lx\n", (unsigned long)pa->kpipe_addr);
+    logf("    kdata_base = 0x%016lx\n", (unsigned long)pa->kdata_base_addr);
+    have_pipe = 1;
+  }
+
+  if (!have_pipe) {
+    logf("    => les tests dependant du pipe seront 'non evalue'\n");
+    text    = (uintptr_t)KERNEL_ADDRESS_TEXT_BASE;
+    data    = (uintptr_t)KERNEL_ADDRESS_DATA_BASE;
+    allproc = (uintptr_t)KERNEL_ADDRESS_ALLPROC;
+  }
+
+  /* ---- 2. firmware : sans pipe ---- */
+  fw = kernel_get_fw_version();
+  logf("\n[2] firmware = 0x%08x\n", (unsigned)fw);
+  logf("    (via SYS_dynlib_get_obj_member, aucun usage du pipe)\n");
+  if (fw == 0) { logf("    [KO] lecture libSceLibcInternal impossible\n"); st_fw = ST_KO; }
+
+  /* ---- 3. bases ---- */
+  if (!have_pipe) {
+    logf("\n[3] bases : non evalue (pas de prerequis)\n");
+    st_bases = ST_NA;
+  } else {
+    text    = (uintptr_t)KERNEL_ADDRESS_TEXT_BASE;
+    data    = (uintptr_t)KERNEL_ADDRESS_DATA_BASE;
+    allproc = (uintptr_t)KERNEL_ADDRESS_ALLPROC;
+
+    logf("\n[3] bases :\n");
+    logf("    TEXT_BASE   = 0x%016lx\n", (unsigned long)text);
+    logf("    DATA_BASE   = 0x%016lx\n", (unsigned long)data);
+    logf("    ALLPROC     = 0x%016lx\n", (unsigned long)allproc);
+    logf("    SECURITY_FL = 0x%016lx\n", (unsigned long)(uintptr_t)KERNEL_ADDRESS_SECURITY_FLAGS);
+    logf("    ROOTVNODE   = 0x%016lx\n", (unsigned long)(uintptr_t)KERNEL_ADDRESS_ROOTVNODE);
+
+    if ((uintptr_t)pa->kdata_base_addr != data) {
+      logf("    [KO] DATA_BASE 0x%lx != kdata_base_addr 0x%lx\n",
+           (unsigned long)data, (unsigned long)pa->kdata_base_addr);
+      st_bases = ST_KO;
+    } else {
+      logf("    [OK] DATA_BASE = kdata_base_addr du loader\n");
+    }
+
+    if (!text || !data || (text >> 48) != 0xffff || (data >> 48) != 0xffff) {
+      logf("    [KO] TEXT_BASE ou DATA_BASE nul / non canonique\n");
+      st_bases = ST_KO;
+    } else if (!(text < data && data < allproc)) {
+      logf("    [KO] ordre text < data < allproc non respecte\n");
+      st_bases = ST_KO;
+    } else {
+      logf("    [OK] TEXT_BASE et DATA_BASE canoniques, ordre coherent\n");
+    }
+
+    if (!allproc) {
+      logf("    [KO] ALLPROC nul\n"); st_bases = ST_KO;
+    } else if ((allproc >> 48) != 0xffff) {
+      logf("    [KO] ALLPROC 0x%016lx non canonique\n", (unsigned long)allproc);
+      st_bases = ST_KO;
+    } else {
+      unsigned long exp_ap = 0;
+      for (unsigned i = 0; i < sizeof(fw_table) / sizeof(fw_table[0]); i++)
+        if ((fw & 0xffff0000u) == fw_table[i].fw) exp_ap = fw_table[i].allproc_off;
+      if (!exp_ap) logf("    [!] firmware hors table locale (ALLPROC)\n");
+      else if ((unsigned long)(allproc - data) == exp_ap)
+        logf("    [OK] ALLPROC a l'offset attendu 0x%lx (canonique != lisible)\n", exp_ap);
+      else {
+        logf("    [KO] ALLPROC offset 0x%lx, attendu 0x%lx\n",
+             (unsigned long)(allproc - data), exp_ap);
+        st_bases = ST_KO;
+      }
+    }
+
+    if (text && data && data > text) {
+      unsigned long delta = (unsigned long)(data - text);
+      unsigned long exp   = 0;
+      logf("    delta DATA-TEXT = 0x%lx\n", delta);
+      for (unsigned i = 0; i < sizeof(fw_table) / sizeof(fw_table[0]); i++)
+        if ((fw & 0xffff0000u) == fw_table[i].fw) exp = fw_table[i].delta;
+      if (!exp) { logf("    [KO] firmware hors table locale\n"); st_bases = ST_KO; }
+      else if (exp == delta) logf("    [OK] ecart conforme (recopie SDK)\n");
+      else { logf("    [KO] ecart attendu 0x%lx\n", exp); st_bases = ST_KO; }
+    } else {
+      st_bases = ST_KO;
+    }
+  }
+
+  /* ---- 4a/4b : lectures brutes (coeur du test) ---- */
+  if (!have_pipe) {
+    logf("\n[4a] [4b] lectures brutes : non evalue\n");
+    st_read = ST_NA;
+  } else {
+    st_read = ST_OK;
+
+    memset(probe, 0xAA, sizeof(probe));
+    if (kread((intptr_t)text, probe, sizeof(probe)) == 0) {
+      int nz = 0;
+      for (unsigned i = 0; i < sizeof(probe); i++) if (probe[i]) nz++;
+      logf("\n[4a] lecture TEXT_BASE : OK -- %d/64 octets non nuls\n", nz);
+      hexdump("TEXT_BASE", (intptr_t)text, probe, 64);
+      if (!nz) { logf("    [KO] zone a zero\n"); st_read = ST_KO; }
+    } else { logf("\n[4a] [KO] lecture TEXT_BASE echouee\n"); st_read = ST_KO; }
+
+    memset(probe, 0xAA, sizeof(probe));
+    if (kread((intptr_t)data, probe, sizeof(probe)) == 0) {
+      int nz = 0;
+      for (unsigned i = 0; i < sizeof(probe); i++) if (probe[i]) nz++;
+      logf("\n[4b] lecture DATA_BASE : OK -- %d/64 octets non nuls\n", nz);
+      hexdump("DATA_BASE", (intptr_t)data, probe, 64);
+      if (!nz) { logf("    [KO] zone a zero\n"); st_read = ST_KO; }
+    } else { logf("\n[4b] [KO] lecture DATA_BASE echouee\n"); st_read = ST_KO; }
+  }
+
+  /* ---- 4c : lecture reelle, mais role informatif ---- */
+  if (!have_pipe) {
+    logf("\n[4c] lecture SECURITY_FLAGS : non evalue\n");
+    st_read_c = ST_NA;
+  } else if (!(uintptr_t)KERNEL_ADDRESS_SECURITY_FLAGS) {
+    logf("\n[4c] lecture SECURITY_FLAGS : IGNOREE, adresse nulle\n");
+    logf("    => [4c] n'a pas ete teste. Elle est hors [4] et hors verdict.\n");
+    st_read_c = ST_NA;
+  } else {
+    uint8_t b = 0xEE;
+    if (kread((intptr_t)KERNEL_ADDRESS_SECURITY_FLAGS, &b, 1) == 0) {
+      logf("\n[4c] octet SECURITY_FLAGS = 0x%02x\n", b);
+      logf("    lecture noyau reelle, mais ROLE informatif : hors verdict.\n");
+      st_read_c = ST_OK;
+    } else {
+      logf("\n[4c] [KO] lecture SECURITY_FLAGS echouee (hors verdict)\n");
+      st_read_c = ST_KO;
+    }
+  }
+
+  /* ---- 4d. parcours allproc : fin sur lien nul, comme le SDK ---- */
+  if (!have_pipe) {
+    logf("\n[4d] parcours allproc : non evalue (pas de prerequis)\n");
+  } else if (!allproc) {
+    logf("\n[4d] [KO] ALLPROC nul : echec, pas 'non evalue'\n");
+    st_walk = st_pid = st_sdk = ST_KO;
+  } else if ((allproc >> 48) != 0xffff) {
+    logf("\n[4d] [KO] ALLPROC non canonique\n");
+    st_walk = st_pid = st_sdk = ST_KO;
+  } else {
+    intptr_t p = 0, found = 0;
+    int32_t  me = (int32_t)getpid();
+    int      n = 0, trunc = 0, loop = 0, badptr = 0, badread = 0;
+
+    logf("\n[4d] parcours allproc (max %d entrees), recherche du pid %d\n",
+         WALK_MAX, (int)me);
+
+    if (kread((intptr_t)allproc, &p, sizeof(p))) {
+      logf("    [KO] lecture de la tete allproc echouee\n");
+      st_walk = st_pid = st_sdk = ST_KO;
+    } else {
+      while (p && n < WALK_MAX) {
+        int32_t  pid = -1;
+        intptr_t nxt = 0;
+
+        if ((p >> 48) != 0xffff) { logf("    [KO] proc non canonique\n"); badptr = 1; break; }
+        if (kread(p + (intptr_t)KERNEL_OFFSET_PROC_P_PID, &pid, sizeof(pid))) {
+          logf("    [KO] lecture p_pid echouee\n"); badread = 1; break;
+        }
+
+        logf("    +%03d  proc 0x%016lx  p_pid = %d\n", n, (unsigned long)p, (int)pid);
+
+        if (!found && pid == me) found = p;
+
+        if (kread(p, &nxt, sizeof(nxt))) {
+          logf("    [KO] lecture du lien suivant echouee\n"); badread = 1; break;
+        }
+        if (nxt == p) { logf("    [!] boucle : lien auto-referent\n"); loop = 1; break; }
+
+        p = nxt;
+        n++;
+      }
+
+      if (p && n >= WALK_MAX) trunc = 1;
+
+      if (badptr || badread || loop) {
+        st_walk = ST_KO;
+        logf("    [KO] parcours invalide (pointeur=%d lecture=%d boucle=%d)\n",
+             badptr, badread, loop);
+      } else if (trunc) {
+        st_walk = ST_TRUNC;
+        logf("    [!] liste tronquee a %d entrees, fin non atteinte\n", WALK_MAX);
+      } else {
+        st_walk = ST_OK;
+        logf("    [OK] parcours termine sur lien nul (%d entrees)\n", n);
+      }
+
+      if (found) {
+        st_pid = ST_OK;
+        logf("    [OK] pid %d trouve a 0x%016lx\n", (int)me, (unsigned long)found);
+      } else {
+        st_pid = ST_KO;
+        logf("    [KO] pid %d non trouve%s\n", (int)me,
+             trunc ? " (tronque : absence NON concluante)" : "");
+      }
+
+      if (found) {
+        intptr_t viaSdk = kernel_get_proc(me);
+        logf("    recoupement SDK kernel_get_proc(%d) = 0x%016lx\n",
+             (int)me, (unsigned long)viaSdk);
+        if (viaSdk && viaSdk == found) {
+          st_sdk = ST_OK;
+          logf("    [OK] meme adresse. RECOUPEMENT, pas preuve independante :\n");
+          logf("         les deux parcours tournent dans le meme environnement noyau.\n");
+        } else {
+          st_sdk = ST_KO;
+          logf("    [KO] adresse differente ou nulle\n");
+        }
+      } else {
+        st_sdk = ST_KO;
+      }
+    }
+  }
+
+#if PHASE >= 2
+  if (!have_pipe) {
+    logf("\n[5] scan : non evalue\n");
+    st_scan = ST_NA;
+  } else {
+    anchors[0] = (anchor_t){ .name = "AES S-box",     .pat = pat_aes_sbox,  .len = 16 };
+    anchors[1] = (anchor_t){ .name = "AES inv S-box", .pat = pat_aes_inv,   .len = 16 };
+    anchors[2] = (anchor_t){ .name = "SHA-256 IV LE", .pat = pat_sha_iv_le, .len = 32 };
+    anchors[3] = (anchor_t){ .name = "SHA-256 IV BE", .pat = pat_sha_iv_be, .len = 32 };
+
+    logf("\n[5] execution du scan (text 32 Mo + data 8 Mo)\n");
     {
-        static long ts[2] = { 3, 0 };
-        ksys(SYS_nanosleep, (long)ts, 0, 0, 0, 0, 0);
+      int a = scan_region("TEXT", (intptr_t)text, SCAN_TEXT_SIZE, anchors, 4);
+      int b = scan_region("DATA", (intptr_t)data, SCAN_DATA_SIZE, anchors, 4);
+      st_scan = (a && b) ? ST_OK : ST_KO;
     }
-    ksys(SYS_exit, 0, 0, 0, 0, 0, 0);
-    for (;;) {
-        static long ts[2] = { 1, 0 };
-        ksys(SYS_nanosleep, (long)ts, 0, 0, 0, 0, 0);
+
+    anchors_found = 0;
+    for (unsigned i = 0; i < 4; i++) {
+      if (anchors[i].found) {
+        anchors_found++;
+        logf("    [OK] %-14s -> 0x%016lx  (%s + 0x%lx | text_base + 0x%lx)\n",
+             anchors[i].name,
+             (unsigned long)(uintptr_t)anchors[i].hit,
+             anchors[i].region,
+             (unsigned long)((uintptr_t)anchors[i].hit -
+                             (uintptr_t)anchors[i].region_base),
+             (unsigned long)((uintptr_t)anchors[i].hit - text));
+      } else {
+        logf("    [--] %-14s non trouve\n", anchors[i].name);
+      }
     }
+  }
+#endif
+
+#if PHASE >= 3
+  if (!have_pipe) { logf("\n[6] dump : non evalue\n"); st_dump = ST_NA; }
+  else {
+    logf("\n[6] dump brut\n");
+    {
+      int a = dump_region("kstuff_text.bin", (intptr_t)text, SCAN_TEXT_SIZE);
+      int b = dump_region("kstuff_data.bin", (intptr_t)data, SCAN_DATA_SIZE);
+      st_dump = (a && b) ? ST_OK : ST_KO;
+    }
+  }
+#endif
+
+  /* ---- resultats ---- */
+  logf("\n=====================================================\n");
+  logf(" RESULTATS (etats independants, aucun n'implique un autre)\n");
+  logf("   [1] arguments + primitives ........... %s\n", st2s(st_args));
+  logf("   [2] firmware lisible ................. %s\n", st2s(st_fw));
+  logf("   [3] bases + ecarts conformes ......... %s\n", st2s(st_bases));
+  logf("   [4] lectures brutes TEXT/DATA ........ %s   (retenu pour le verdict)\n",
+       st2s(st_read));
+  logf("   [4c] lecture SECURITY_FLAGS .......... %s   (role informatif)\n",
+       st2s(st_read_c));
+  logf("   [5] etat du parcours allproc ......... %s\n", st2s(st_walk));
+  logf("   [6] pid du payload retrouve .......... %s\n", st2s(st_pid));
+  logf("   [7] recoupement kernel_get_proc ...... %s   (pas preuve independante)\n",
+       st2s(st_sdk));
+#if PHASE >= 2
+  logf("   [8] scan execute ..................... %s\n", st2s(st_scan));
+  if (anchors_found >= 0)
+    logf("   [9] ancres detectees ................. %d/4\n", anchors_found);
+  else
+    logf("   [9] ancres detectees ................. n/a\n");
+#endif
+#if PHASE >= 3
+  logf("   [10] dump ............................ %s\n", st2s(st_dump));
+#endif
+  logf("-----------------------------------------------------\n");
+  logf(" a lire avant d'interpreter :\n");
+  logf("  - [4c] fait une VRAIE lecture noyau et peut reussir ; ce qui est\n");
+  logf("    'hors verdict' est son ROLE, pas sa nature. 'non evalue' veut\n");
+  logf("    dire IGNOREE (adresse nulle).\n");
+  logf("  - [5] qualifie le PARCOURS, pas la presence du process.\n");
+  logf("  - [6] est independant de [5]. [7] est un recoupement.\n");
+#if PHASE >= 2
+  logf("  - [8] dit que les lectures du scan sont terminees ; il ne dit\n");
+  logf("    rien sur [9], qui compte les ancres effectivement trouvees.\n");
+#endif
+  logf("-----------------------------------------------------\n");
+  logf(" DEFINITION DES NIVEAUX (identique au calcul)\n");
+  logf("   FONCTIONNELLE      : [1][2][3][4] OK, [5] OK,     [6] OK, [7] OK\n");
+  logf("   PARTIELLE          : [1][2][3][4] OK, [5] TRONQUE,[6] OK, [7] OK\n");
+  logf("   PARTIELLE SANS PID : [1][2][3][4] OK, [5] TRONQUE,[6] KO, [7] KO\n");
+  logf("   INCOMPLET          : tout autre cas\n");
+  logf(" [4c] n'entre dans aucun niveau.\n");
+  logf("-----------------------------------------------------\n");
+  logf(" CODES DE SORTIE\n");
+  logf("   %d = FONCTIONNELLE   %d = PARTIELLE\n", RC_FULL, RC_PARTIAL);
+  logf("   %d = PARTIELLE SANS PID   %d = INCOMPLET\n", RC_NO_PID, RC_INCOMPLETE);
+  logf("   (convention explicite : un niveau sans PID est un echec pour\n");
+  logf("    un script appelant, d'ou un code non nul.)\n");
+  logf("-----------------------------------------------------\n");
+
+  base_ok = (st_args == ST_OK) && (st_fw == ST_OK) &&
+            (st_bases == ST_OK) && (st_read == ST_OK);
+  core_ok = base_ok && (st_pid == ST_OK) && (st_sdk == ST_OK);
+
+  if (core_ok && st_walk == ST_OK)
+    verdict = V_FULL;
+  else if (core_ok && st_walk == ST_TRUNC)
+    verdict = V_PARTIAL;
+  else if (base_ok && st_walk == ST_TRUNC &&
+           st_pid == ST_KO && st_sdk == ST_KO)
+    verdict = V_NO_PID;
+  else
+    verdict = V_INCOMPLETE;
+
+  if (verdict == V_FULL)
+    logf(" VERDICT : FONCTIONNELLE.\n"
+         "   [1] args, [2] firmware, [3] bases, [4] lectures, [5] parcours\n"
+         "   complet, [6] pid, [7] recoupement : tous OK.\n"
+         "   Validation fonctionnelle dans les conditions du test, avec les\n"
+         "   adresses et structures definies par le SDK. Pas une preuve absolue.\n");
+  else if (verdict == V_PARTIAL)
+    logf(" VERDICT : PARTIELLE.\n"
+         "   [1] a [4] OK, [6] et [7] OK : la lecture et la chaine pointeur\n"
+         "   sont validees. Seul [5] est TRONQUE : la liste depassait %d\n"
+         "   entrees, la fin n'a pas ete atteinte.\n", WALK_MAX);
+  else if (verdict == V_NO_PID)
+    logf(" VERDICT : PARTIELLE SANS PID.\n"
+         "   [1] a [4] OK : la lecture noyau fonctionne. [5] TRONQUE et [6]\n"
+         "   KO : le pid n'a pas ete atteint avant la limite, donc son\n"
+         "   absence n'est PAS concluante. [7] KO en consequence.\n");
+  else
+    logf(" VERDICT : INCOMPLET.\n"
+         "   Une condition necessaire a l'un des trois niveaux de validation\n"
+         "   ci-dessus n'est pas satisfaite. Voir les statuts [1] a [7]\n"
+         "   et les lignes [KO] / [TRONQUE] / non evalue.\n");
+  logf("=====================================================\n");
+  logf("\n C'EST FINI JOHNNY L'OGNION !\n");
+  logf(" la tete de boule est en securite\n\n");
+
+  if (g_fd >= 0) fsync(g_fd);
+
+#if PHASE >= 2
+  logf("[11] test isole : __syscall(599) sans argument\n");
+  logf("     INDICE, pas conclusion : un arret ici peut aussi venir d'un\n");
+  logf("     crash, d'un blocage, ou d'un probleme d'ecriture du journal.\n");
+  logf("     Et __syscall(599) sans argument n'est PAS equivalent a l'appel\n");
+  logf("     du SDK qui cible un PID via pt_syscall(pid, 599).\n");
+  {
+    long r = (long)__syscall(599);
+    logf("     retour = %ld  errno = %d\n", r, errno);
+  }
+  logf("[12] marqueur final : si cette ligne existe, l'appel 599 est revenu.\n");
+#endif
+
+  if (g_fd >= 0) { fsync(g_fd); close(g_fd); g_fd = -1; }
+
+  switch (verdict) {
+  case V_FULL:    rc = RC_FULL;    break;
+  case V_PARTIAL: rc = RC_PARTIAL; break;
+  case V_NO_PID:  rc = RC_NO_PID;  break;
+  default:        rc = RC_INCOMPLETE;
+  }
+  return rc;
 }
