@@ -1,18 +1,32 @@
+# kstuff-probe -- build via le SDK PS5 officiel
+# Le chemin du SDK est fourni par la variable PS5_PAYLOAD_SDK.
+
 PS5_PAYLOAD_SDK ?= /opt/ps5-payload-sdk
-SDK_BIN := $(PS5_PAYLOAD_SDK)/bin
-CC := $(or $(wildcard $(SDK_BIN)/prospero-clang),$(wildcard $(SDK_BIN)/x86_64-ps5-prospero-clang),clang)
+PS5_HOST ?= ps5
+PS5_PORT ?= 9021
 
-CFLAGS  = -O2 -Wall -Wextra -std=gnu11 -ffreestanding -fno-builtin \
-          -fno-stack-protector -mno-red-zone -fno-pic \
-          -fno-asynchronous-unwind-tables -fno-unwind-tables
-LDFLAGS = -nostdlib -no-pie -Wl,-T,payload.ld -Wl,--gc-sections \
-          -Wl,-z,max-page-size=0x4000 -Wl,--build-id=none
+ifdef PS5_PAYLOAD_SDK
+  ifneq ($(wildcard $(PS5_PAYLOAD_SDK)/toolchain/prospero.mk),)
+    include $(PS5_PAYLOAD_SDK)/toolchain/prospero.mk
+  else ifneq ($(wildcard $(PS5_PAYLOAD_SDK)/lib/prospero.mk),)
+    include $(PS5_PAYLOAD_SDK)/lib/prospero.mk
+  else
+    $(error prospero.mk introuvable sous $(PS5_PAYLOAD_SDK))
+  endif
+else
+  $(error PS5_PAYLOAD_SDK non defini)
+endif
 
-all: kstuff-probe.elf
-kstuff-probe.elf: kstuff-probe.o payload.ld
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ kstuff-probe.o
-kstuff-probe.o: kstuff-probe.c
-	$(CC) $(CFLAGS) -c -o $@ $<
+ELF    := kstuff-probe.elf
+CFLAGS := -Wall -g -O2
+
+all: $(ELF)
+
+$(ELF): kstuff-probe.c
+	$(CC) $(CFLAGS) -o $@ $^
+
 clean:
-	rm -f kstuff-probe.o kstuff-probe.elf
-.PHONY: all clean
+	rm -f $(ELF)
+
+test: $(ELF)
+	$(PS5_DEPLOY) -h $(PS5_HOST) -p $(PS5_PORT) $^
